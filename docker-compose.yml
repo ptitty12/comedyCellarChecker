@@ -1,0 +1,31 @@
+services:
+  comedy-cellar-checker:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Watch these dates (comma-separated, YYYY-MM-DD)
+      TARGET_DATES: "2026-09-10,2026-09-11,2026-09-12"
+      CHECK_INTERVAL_SECONDS: "300"
+      TZ: "America/New_York"
+
+      # --- notifications: ntfy works with zero signup, see README ---
+      NTFY_TOPIC: "${NTFY_TOPIC:-comedycellar-alerts-pt-7g3k1x}"
+
+      # Optional extra channels — set any of these and they all fire:
+      # TELEGRAM_BOT_TOKEN: ""
+      # TELEGRAM_CHAT_ID: ""
+      # DISCORD_WEBHOOK_URL: ""
+      # SLACK_WEBHOOK_URL: ""
+      # PUSHOVER_TOKEN: ""
+      # PUSHOVER_USER: ""
+      # WEBHOOK_URL: ""
+      # SMTP_HOST: "smtp.gmail.com"
+      # SMTP_PORT: "587"
+      # SMTP_USER: "you@gmail.com"
+      # SMTP_PASS: "app-password"
+      # SMTP_TO: "you@gmail.com"
+    volumes:
+      - checker-data:/data
+
+volumes:
+  checker-data:

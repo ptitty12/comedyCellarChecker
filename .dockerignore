@@ -1,0 +1,12 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+test_checker.py
+README.md
+docker-compose.yml
+.github
+state.json
+.env
