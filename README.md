@@ -36,12 +36,20 @@ Every check runs these, cheapest first, and stops early once dates are found:
    → {"show":{"html":"<…6:00 pm show - …>"}}
    ```
 
-   The response never names the date it describes, so "shows present" only means
-   "shows for the date we asked for" if the endpoint honours its `date`
-   parameter. Every check therefore first asks for a date ~10 months out, which
-   cannot have a lineup. If *that* comes back with showtimes, the endpoint is
-   echoing something unrelated and **all of its answers are discarded** rather
-   than fire a false "tickets are up". This guard is tested.
+   The response never names the date it describes, so it is calibrated against
+   two controls before any answer is believed:
+
+   - **positive** — a date 3 days out, which the site definitely lists, must come
+     back *with* showtimes. Without this, an endpoint that answers "no shows" to
+     everything looks perfectly healthy while detecting nothing.
+   - **negative** — a date ~10 months out, which cannot have a lineup, must come
+     back *without* showtimes, or the endpoint is echoing something unrelated and
+     would report every target as live.
+
+   Several date encodings are tried against those controls. If none passes, the
+   strategy reports "contributes nothing" instead of appearing to work. **On the
+   live site today, none does** — the endpoint only honours its own `"today"`
+   keyword — so detection currently rests on strategy 3. Both guards are tested.
 3. **Headless Chromium** — renders the page like a real browser, then harvests
    dates from the live DOM *and* from every same-origin XHR payload. This is
    what establishes the date-through on this site, and what discovered the API
@@ -97,10 +105,31 @@ starts serving dates in HTML).
 Verify anytime from the container terminal:
 
 ```bash
+python checker.py --selfcheck     # can this deployment launch Chromium? (run this first)
 python checker.py --diagnose      # what every strategy sees, incl. date-through
 python checker.py --test-notify   # push a test message through every channel
 python checker.py --once          # one full check, then exit
 ```
+
+## Verified against the live site
+
+Measured on 2026-08-11 by running `--diagnose` from a CI runner (a dev sandbox
+often cannot reach the site):
+
+| Strategy | Result |
+|---|---|
+| static, lineup page | HTTP 200, 83.5 KB, **0 dates** — JS-rendered |
+| static, reservations | HTTP 200, 104 KB, **0 dates** |
+| static, homepage | 5 dates, furthest 2027-07-29 — unrelated, hence non-authoritative |
+| `/wp-json/` probes | 3 × 404, 1 × 200 with no dates |
+| headless Chromium | HTTP 200, **29 dates, through 2026-09-07** |
+| lineup API, `"today"` | 30 KB of showtimes |
+| lineup API, ISO dates (+3 / +20 / +60 / +300) | empty every time — date param not honoured |
+
+So the Cellar lists roughly **four weeks** ahead and rolls the window forward
+daily. The date-through is therefore a live canary: it should advance by one day
+every day, and a target date is reachable a few days before the show once the
+window covers it.
 
 The **Diagnose live site** GitHub Actions workflow runs `--diagnose` against the
 real site on demand and daily, which is also an early warning that the site

@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -93,6 +93,7 @@ class FakeHttp:
         # Unlisted dates answer like the real endpoint does for a date with no
         # lineup yet — including the sentinel the trust guard queries.
         self.api_default = api_default or (200, EMPTY_API)
+        self.calls, self.last = 0, None
 
     def get(self, url):
         return self.pages.get(url, (404, "nope"))
@@ -102,6 +103,8 @@ class FakeHttp:
 
     def post_form(self, url, data, referer=None):
         """Keyed by the requested date, mimicking the real lineup endpoint."""
+        self.calls += 1
+        self.last = (url, data)
         return self.api.get(json.loads(data["json"])["date"], self.api_default)
 
     def reset(self):
@@ -150,48 +153,85 @@ class TestStrategies(unittest.TestCase):
         self.assertFalse(any(s.ok for s in out))
 
 class TestLineupApi(unittest.TestCase):
-    """The endpoint never echoes the date, so the trust guard is load-bearing."""
+    """The endpoint never echoes the date, so both controls are load-bearing."""
+
+    def setUp(self):
+        sources._CALIBRATION.clear()
+
+    def _http(self, **kw):
+        """An endpoint that honours ISO dates for anything within `window` days."""
+        window = kw.pop("window", 30)
+        api = {}
+        for off in range(-1, window + 1):
+            api[(TODAY + timedelta(days=off)).isoformat()] = (200, shows_api())
+        api.update(kw.pop("api", {}))
+        return FakeHttp(api=api, **kw)
+
+    def test_calibration_accepts_a_working_encoding(self):
+        encoder, detail = sources.calibrate_lineup_api(self._http(), TODAY)
+        self.assertIsNotNone(encoder)
+        self.assertEqual(encoder(SEP10), "2026-09-10")
+        self.assertIn("verified", detail)
 
     def test_shows_for_a_target_is_a_hit(self):
-        http = FakeHttp(api={SEP11.isoformat(): (200, shows_api())})
-        s = from_lineup_api(http, TARGETS, TODAY)[0]
+        # Window wide enough to include the targets (31 days out).
+        s = from_lineup_api(self._http(window=40), TARGETS, TODAY)[0]
         self.assertTrue(s.ok)
-        self.assertIn(SEP11, s.target_hits)
-        self.assertNotIn(SEP10, s.target_hits)
+        self.assertEqual(set(s.target_hits), set(TARGETS))
 
-    def test_empty_lineup_is_not_a_hit(self):
-        http = FakeHttp(api={t.isoformat(): (200, EMPTY_API) for t in TARGETS})
-        s = from_lineup_api(http, TARGETS, TODAY)[0]
+    def test_targets_outside_the_window_are_not_hits(self):
+        s = from_lineup_api(self._http(window=20), TARGETS, TODAY)[0]
         self.assertTrue(s.ok)
         self.assertEqual(s.target_hits, {})
 
-    def test_endpoint_that_ignores_the_date_is_distrusted(self):
-        """If a 300-day-out sentinel returns shows, every answer is discarded."""
-        # Every date, however absurd, answers with a lineup.
-        http = FakeHttp(api_default=(200, shows_api()))
-        s = from_lineup_api(http, TARGETS, TODAY)[0]
+    def test_endpoint_that_never_says_yes_declares_itself_useless(self):
+        """The live failure: ISO dates always answer 'no shows'.
+
+        The negative control alone passes here, so without a positive control
+        this would look healthy while being incapable of ever detecting a date.
+        """
+        s = from_lineup_api(FakeHttp(api_default=(200, EMPTY_API)), TARGETS, TODAY)[0]
+        self.assertTrue(s.ok)
+        self.assertEqual(s.target_hits, {})
+        self.assertIn("contributes nothing", s.detail)
+        self.assertIn("no date encoding works", s.detail)
+
+    def test_endpoint_that_ignores_the_date_is_rejected(self):
+        """Says yes to everything, including a date 300 days out."""
+        s = from_lineup_api(FakeHttp(api_default=(200, shows_api())), TARGETS, TODAY)[0]
         self.assertTrue(s.ok)
         self.assertEqual(s.target_hits, {})     # would otherwise be 3 false alarms
         self.assertEqual(s.dates, set())
-        self.assertIn("UNTRUSTWORTHY", s.detail)
+        self.assertIn("echoes", s.detail)
 
     def test_unreachable_endpoint_is_reported(self):
         s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
         self.assertFalse(s.ok)
         self.assertIn("unreachable", s.detail)
 
+    def test_outage_after_good_calibration_reports_unhealthy(self):
+        """A cached calibration must not mask a dead endpoint from the watchdog."""
+        sources.calibrate_lineup_api(self._http(), TODAY)      # calibrate while up
+        s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
+        self.assertFalse(s.ok)                                 # not "fine, no shows"
+        self.assertEqual(sources._CALIBRATION, {})             # will re-verify
+
+    def test_calibration_is_cached_per_day(self):
+        http = self._http()
+        sources.calibrate_lineup_api(http, TODAY)
+        before = http.calls
+        sources.calibrate_lineup_api(http, TODAY)
+        self.assertEqual(http.calls, before)          # no repeat probing
+        sources.calibrate_lineup_api(http, TODAY + timedelta(days=1))
+        self.assertGreater(http.calls, before)        # new day, re-verified
+
     def test_request_matches_the_captured_contract(self):
-        seen = {}
-
-        class Recorder(FakeHttp):
-            def post_form(self, url, data, referer=None):
-                seen["url"], seen["data"] = url, data
-                return 200, EMPTY_API
-
-        from_lineup_api(Recorder(), [SEP10], TODAY)
-        self.assertEqual(seen["url"], sources.LINEUP_API_URL)
-        self.assertEqual(seen["data"]["action"], "cc_get_shows")
-        self.assertEqual(json.loads(seen["data"]["json"]),
+        http = self._http()
+        from_lineup_api(http, [SEP10], TODAY)
+        url, data = http.last
+        self.assertEqual(url, sources.LINEUP_API_URL)
+        self.assertEqual(data["action"], "cc_get_shows")
+        self.assertEqual(json.loads(data["json"]),
                          {"date": SEP10.isoformat(), "venue": "newyork",
                           "type": "lineup"})
 
@@ -202,9 +242,6 @@ class TestLineupApi(unittest.TestCase):
         self.assertTrue(sources.has_shows(fragment))
 
 
-# Mirrors the real failure mode: no date appears anywhere in this HTML. The day
-# offsets are turned into dates by JS (provable DOM harvest), and a separate XHR
-# carries a date that never reaches the DOM (provable payload capture).
 JS_PAGE = """<!doctype html><html><body><div id="app">loading...</div>
 <script>
 fetch('/api/offsets').then(function (r) { return r.json(); }).then(function (j) {
@@ -310,6 +347,9 @@ class TestBrowserStrategy(unittest.TestCase):
 
 
 class TestDiscoveryOrchestration(unittest.TestCase):
+    def setUp(self):
+        sources._CALIBRATION.clear()   # process-global by design; isolate tests
+
     def test_browser_skipped_when_lineup_html_has_dates(self):
         cfg = make_cfg(watch_urls=[sources.LINEUP_URL])
         http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_WITH_SEP10)})

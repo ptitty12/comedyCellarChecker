@@ -58,6 +58,23 @@ REST_ENDPOINTS = [
 
 API_ACTION = "cc_get_shows"
 
+# The captured request used the literal keyword "today", and a live probe showed
+# an ISO date returns an empty lineup even for dates the site definitely lists.
+# So the encoding the endpoint expects is unknown: these are tried against a
+# control date until one demonstrably works.
+DATE_ENCODINGS = [
+    ("iso", lambda d: d.isoformat()),
+    ("us-slash", lambda d: d.strftime("%m/%d/%Y")),
+    ("us-slash-short", lambda d: f"{d.month}/{d.day}/{d.year}"),
+    ("dash-us", lambda d: d.strftime("%m-%d-%Y")),
+    ("compact", lambda d: d.strftime("%Y%m%d")),
+    ("epoch", lambda d: str(int(time.mktime(d.timetuple())))),
+]
+
+# Offset used as the positive control: far enough out to be a real test, well
+# inside the ~4-week window the site was measured to publish.
+POSITIVE_PROBE_OFFSET_DAYS = 3
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -223,8 +240,8 @@ def from_rest(http, targets, today):
 def query_lineup_api(http, when, venue="newyork"):
     """Ask the lineup endpoint about one date.
 
-    `when` is a date or a keyword the site accepts (e.g. "today").
-    Returns (reachable, text, detail) where text is the lineup fragment.
+    `when` is an already-encoded string (see DATE_ENCODINGS) or a keyword the site
+    accepts, e.g. "today". Returns (reachable, fragment, detail).
     """
     key = when if isinstance(when, str) else when.isoformat()
     payload = {"action": API_ACTION,
@@ -251,40 +268,88 @@ def has_shows(fragment):
     return bool(SHOWTIME_RE.search(fragment))
 
 
-def from_lineup_api(http, targets, today):
-    """Query the site's own endpoint per target date.
+_CALIBRATION = {}
 
-    Because the response never names the date it describes, this strategy first
-    proves the endpoint honours its date parameter at all: it asks for a date
-    ~10 months out, which cannot have a lineup. If that comes back with
-    showtimes, the endpoint is echoing something unrelated (probably today) and
-    every answer it gives is discarded rather than risk a false "tickets are up".
+
+def calibrate_lineup_api(http, today, cache=_CALIBRATION):
+    """Find a date encoding the endpoint provably honours.
+
+    Two controls, because either one alone can be fooled:
+
+    * positive — a date a few days out, which the site definitely lists, must come
+      back WITH showtimes. Without this an endpoint that silently answers "no
+      shows" to every encoding looks perfectly healthy while detecting nothing.
+      (Measured on the live site: ISO dates do exactly that.)
+    * negative — a date ~10 months out, which cannot have a lineup, must come back
+      WITHOUT showtimes, or the endpoint is echoing something unrelated and would
+      report every target as live.
+
+    Returns (encoder or None, detail). Cached per day, since the encoding a site
+    accepts does not change between checks.
+    """
+    if cache.get("day") == today:
+        return cache.get("encoder"), cache.get("detail")
+
+    positive = today + timedelta(days=POSITIVE_PROBE_OFFSET_DAYS)
+    sentinel = today + timedelta(days=SENTINEL_OFFSET_DAYS)
+    encoder, detail = None, ""
+    tried = []
+    for name, enc in DATE_ENCODINGS:
+        reachable, fragment, why = query_lineup_api(http, enc(positive))
+        if not reachable:
+            detail = f"unreachable ({why})"
+            break
+        if not has_shows(fragment):
+            tried.append(name)
+            continue
+        reachable, fragment, _ = query_lineup_api(http, enc(sentinel))
+        if reachable and has_shows(fragment):
+            tried.append(f"{name}(echoes)")
+            continue
+        encoder, detail = enc, f"date encoding '{name}' verified against both controls"
+        break
+    else:
+        detail = (f"no date encoding works (tried {', '.join(tried)}); endpoint only "
+                  f"answers for its own keywords, so it cannot detect a future date")
+
+    cache.update(day=today, encoder=encoder, detail=detail)
+    return encoder, detail
+
+
+def from_lineup_api(http, targets, today):
+    """Query the site's own endpoint per target date, if it can be trusted to.
+
+    Contributes nothing unless calibration proves the endpoint honours a date
+    encoding — reporting that plainly rather than appearing to work.
     """
     s = Sighting("lineup-api")
-    sentinel = today + timedelta(days=SENTINEL_OFFSET_DAYS)
-    reachable, fragment, detail = query_lineup_api(http, sentinel)
-    if not reachable:
-        s.detail = f"lineup-api unreachable ({detail})"
-        return [s]
-    s.ok = True
-    if has_shows(fragment):
-        s.detail = (f"lineup-api UNTRUSTWORTHY: sentinel {sentinel} returned "
-                    f"showtimes, so it ignores the date parameter — results dropped")
+    encoder, detail = calibrate_lineup_api(http, today)
+    if encoder is None:
+        s.ok = not detail.startswith("unreachable")
+        s.detail = f"lineup-api contributes nothing: {detail}"
         return [s]
 
-    results = []
+    results, reached = [], False
     for t in targets:
-        reachable, fragment, detail = query_lineup_api(http, t)
+        reachable, fragment, why = query_lineup_api(http, encoder(t))
         if not reachable:
-            results.append(f"{t}:{detail}")
+            results.append(f"{t}:{why}")
             continue
+        reached = True
         if has_shows(fragment):
             s.dates.add(t)
             s.target_hits[t] = f"lineup API returned showtimes for {t}"
             results.append(f"{t}:SHOWS")
         else:
             results.append(f"{t}:none")
-    s.detail = f"lineup-api (sentinel {sentinel} clean) " + ", ".join(results)
+
+    # Health must reflect this check, not a calibration cached when things worked.
+    # Claiming ok here would keep the "checker is BLIND" watchdog quiet during an
+    # outage, which is the one time it needs to fire.
+    s.ok = reached
+    if not reached:
+        _CALIBRATION.clear()   # re-verify once the endpoint answers again
+    s.detail = f"lineup-api ({detail}) " + ", ".join(results)
     return [s]
 
 
