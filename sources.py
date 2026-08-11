@@ -14,7 +14,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from urllib.parse import urlparse
 
 import requests
 
@@ -26,11 +26,12 @@ LINEUP_URL = "https://www.comedycellar.com/new-york-line-up/"
 RESERVATIONS_URL = "https://www.comedycellar.com/reservations-newyork/"
 AJAX_URL = "https://www.comedycellar.com/wp-admin/admin-ajax.php"
 
-# Both reservation slugs are tried: the site has used each at different times.
+# The homepage is included because a target date may be announced there in prose;
+# it is deliberately NOT authoritative for the date-through (see AUTHORITATIVE_URLS)
+# because it carries unrelated far-future dates.
 DEFAULT_STATIC_URLS = [
     LINEUP_URL,
     RESERVATIONS_URL,
-    "https://www.comedycellar.com/reservations-new-york/",
     "https://www.comedycellar.com/",
 ]
 
@@ -56,6 +57,12 @@ CHROMIUM_GLOBS = [
 ]
 
 
+# Pages whose dates represent the bookable show window. The homepage is scanned
+# for target dates too, but a stray date in a news blurb there must never be
+# mistaken for the lineup's date-through, nor suppress a browser render.
+AUTHORITATIVE_URLS = {LINEUP_URL, RESERVATIONS_URL}
+
+
 @dataclass
 class Sighting:
     strategy: str
@@ -64,6 +71,11 @@ class Sighting:
     dates: set = field(default_factory=set)
     target_hits: dict = field(default_factory=dict)
     xhr_urls: list = field(default_factory=list)
+    # Request/response samples from the site's own API, captured during a render
+    # so the endpoint can be called directly instead of launching a browser.
+    api_samples: list = field(default_factory=list)
+    # Whether this source's dates may define the date-through.
+    authoritative: bool = True
 
     def scan(self, text, targets, today):
         """Pull every date out of a blob, and note which targets it proves."""
@@ -145,7 +157,8 @@ class HttpClient:
 def from_static(http, urls, targets, today):
     out = []
     for url in urls:
-        s = Sighting("static", detail=f"static {url}")
+        s = Sighting("static", detail=f"static {url}",
+                     authoritative=url in AUTHORITATIVE_URLS)
         status, text = http.get(url)
         if status == 200 and len(text) > 3000:
             s.ok = True
@@ -280,19 +293,31 @@ def from_browser(url, targets, today, settle_ms=3500, timeout_s=60):
         s.detail = f"browser unavailable: playwright not importable ({exc})"
         return [s]
 
-    bodies, xhr_urls = [], []
+    bodies, xhr_urls, api_samples = [], [], []
+    page_host = urlparse(url).hostname
 
     def on_response(resp):
         try:
-            ct = (resp.headers or {}).get("content-type", "")
-            if not any(k in ct for k in ("json", "javascript", "text/html")):
-                return
             if resp.request.resource_type not in ("xhr", "fetch"):
+                return
+            # Same-origin only: third-party ad/analytics traffic is pure noise.
+            if urlparse(resp.url).hostname != page_host:
+                return
+            ct = (resp.headers or {}).get("content-type", "")
+            if not any(k in ct for k in ("json", "javascript", "text/html", "text/plain")):
                 return
             xhr_urls.append(f"{resp.request.method} {resp.url} [{resp.status}]")
             body = resp.text()
             if body and len(body) < 2_000_000:
                 bodies.append(body)
+                api_samples.append({
+                    "method": resp.request.method,
+                    "url": resp.url,
+                    "post_data": (resp.request.post_data or "")[:1000],
+                    "content_type": ct,
+                    "status": resp.status,
+                    "body_head": body[:1200],
+                })
         except Exception:
             pass  # a body that can't be read is not worth failing the render over
 
@@ -347,6 +372,7 @@ def from_browser(url, targets, today, settle_ms=3500, timeout_s=60):
     blob = "\n".join([html_text, body_text, "\n".join(extras), "\n".join(bodies)])
     s.ok = len(html_text) > 500
     s.xhr_urls = xhr_urls
+    s.api_samples = api_samples
     s.scan(blob, targets, today)
     s.detail = (f"browser {url} (HTTP {nav_status}, dom {len(html_text)}B, "
                 f"{len(extras)} nodes, {len(bodies)} xhr payloads, {len(s.dates)} dates)")
@@ -369,13 +395,16 @@ def discover(http, targets, today, static_urls=None, use_browser=True,
     if use_ajax:
         sightings += from_ajax(http, targets, today)
 
-    cheap_dates = set().union(*(s.dates for s in sightings)) if sightings else set()
-    if use_browser and not cheap_dates:
+    # Render only when no *authoritative* source produced a date. Gating on "any
+    # date anywhere" would let one stray homepage date skip the render, which is
+    # the only strategy that can actually read this site.
+    if use_browser and not any(s.dates for s in sightings if s.authoritative):
         sightings += from_browser(browser_url, targets, today)
 
     dates, hits = set(), {}
     for s in sightings:
-        dates |= s.dates
+        if s.authoritative:
+            dates |= s.dates
         for d, ev in s.target_hits.items():
             hits.setdefault(d, []).append(ev)
     return sightings, dates, hits

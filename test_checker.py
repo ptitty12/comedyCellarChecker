@@ -224,6 +224,22 @@ class TestBrowserStrategy(unittest.TestCase):
         s = from_browser(self.url, TARGETS, TODAY, settle_ms=2000)[0]
         self.assertEqual(horizon_of(s.dates, TODAY), SEP12)
 
+    def test_api_samples_capture_request_and_response(self):
+        """The captured contract is what lets us drop the browser later."""
+        s = from_browser(self.url, TARGETS, TODAY, settle_ms=2000)[0]
+        offsets = [a for a in s.api_samples if "/api/offsets" in a["url"]]
+        self.assertTrue(offsets, s.api_samples)
+        self.assertEqual(offsets[0]["method"], "GET")
+        self.assertEqual(offsets[0]["status"], 200)
+        self.assertIn("offsets", offsets[0]["body_head"])
+
+    def test_cross_origin_xhr_is_not_captured(self):
+        """Ad/analytics traffic must not pollute the captured API contract."""
+        s = from_browser(self.url, TARGETS, TODAY, settle_ms=2000)[0]
+        hosts = {u.split("//")[1].split("/")[0].split(":")[0]
+                 for u in s.xhr_urls if "//" in u}
+        self.assertEqual(hosts, {"127.0.0.1"}, s.xhr_urls)
+
     def test_navigation_failure_is_not_counted_as_a_render(self):
         """Chromium's error page is big; it must never look like a successful read."""
         s = from_browser("http://127.0.0.1:9/nope", TARGETS, TODAY, timeout_s=8)[0]
@@ -240,9 +256,9 @@ class TestBrowserStrategy(unittest.TestCase):
 
 
 class TestDiscoveryOrchestration(unittest.TestCase):
-    def test_browser_skipped_when_cheap_strategy_finds_dates(self):
-        cfg = make_cfg(watch_urls=["u"])
-        http = FakeHttp(pages={"u": (200, PAGE_WITH_SEP10)})
+    def test_browser_skipped_when_lineup_html_has_dates(self):
+        cfg = make_cfg(watch_urls=[sources.LINEUP_URL])
+        http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_WITH_SEP10)})
         with mock.patch.object(sources, "from_browser") as browser:
             res = perform_check(cfg, http)
         browser.assert_not_called()
@@ -250,8 +266,8 @@ class TestDiscoveryOrchestration(unittest.TestCase):
         self.assertIn(SEP10, res.found)
 
     def test_browser_used_when_html_has_no_dates(self):
-        cfg = make_cfg(watch_urls=["u"])
-        http = FakeHttp(pages={"u": (200, PAGE_NO_DATES)})
+        cfg = make_cfg(watch_urls=[sources.LINEUP_URL])
+        http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_NO_DATES)})
         fake = Sighting("browser", ok=True, detail="browser stub",
                         dates={date(2026, 8, 18)})
         with mock.patch.object(sources, "from_browser", return_value=[fake]) as browser:
@@ -264,6 +280,31 @@ class TestDiscoveryOrchestration(unittest.TestCase):
         res = perform_check(make_cfg(watch_urls=["u"], use_browser=False), FakeHttp())
         self.assertIsNone(res.horizon)
         self.assertFalse(res.ok)
+
+    def test_stray_homepage_date_cannot_suppress_the_browser(self):
+        """A date in homepage copy must not skip the render nor set the horizon."""
+        homepage = "<html>" + "x" * 3000 + "<p>Our anniversary gala, December 1</p></html>"
+        cfg = make_cfg(watch_urls=[sources.LINEUP_URL, "https://www.comedycellar.com/"])
+        http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_NO_DATES),
+                               "https://www.comedycellar.com/": (200, homepage)})
+        fake = Sighting("browser", ok=True, detail="browser stub",
+                        dates={date(2026, 8, 18)})
+        with mock.patch.object(sources, "from_browser", return_value=[fake]) as browser:
+            res = perform_check(cfg, http)
+        browser.assert_called_once()
+        self.assertEqual(res.horizon, date(2026, 8, 18))   # not December 1
+
+    def test_target_date_on_homepage_still_alerts(self):
+        """Non-authoritative pages don't set the horizon but can still prove a date."""
+        homepage = "<html>" + "x" * 3000 + "<p>Tickets for September 11 are live</p></html>"
+        cfg = make_cfg(watch_urls=[sources.LINEUP_URL, "https://www.comedycellar.com/"])
+        http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_NO_DATES),
+                               "https://www.comedycellar.com/": (200, homepage)})
+        fake = Sighting("browser", ok=True, detail="stub", dates={date(2026, 8, 18)})
+        with mock.patch.object(sources, "from_browser", return_value=[fake]):
+            res = perform_check(cfg, http)
+        self.assertIn(SEP11, res.found)
+        self.assertEqual(res.horizon, date(2026, 8, 18))
 
 
 def result(horizon=None, source="static", found=(), ok=True):

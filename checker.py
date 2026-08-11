@@ -649,6 +649,12 @@ def diagnose(cfg) -> int:
                   f"{' …' if len(ds) > 12 else ''}  (max {max(ds)})")
         for u in s.xhr_urls[:15]:
             print(f"         xhr: {u}")
+        for sample in s.api_samples[:4]:
+            print(f"         --- API SAMPLE {sample['method']} {sample['url']} "
+                  f"[{sample['status']}] {sample['content_type']}")
+            if sample["post_data"]:
+                print(f"             request body: {sample['post_data']}")
+            print(f"             response head: {sample['body_head']}")
     print("-" * 72)
     print("DATE THROUGH:",
           f"{res.horizon} (via {res.horizon_source})" if res.horizon
