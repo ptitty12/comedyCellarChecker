@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -24,7 +25,19 @@ log = logging.getLogger("cellar.sources")
 
 LINEUP_URL = "https://www.comedycellar.com/new-york-line-up/"
 RESERVATIONS_URL = "https://www.comedycellar.com/reservations-newyork/"
-AJAX_URL = "https://www.comedycellar.com/wp-admin/admin-ajax.php"
+
+# The site's own lineup endpoint, captured from a browser render on 2026-08-11:
+#   POST /lineup/api/
+#   action=cc_get_shows&json={"date":"today","venue":"newyork","type":"lineup"}
+#   -> {"show": {"html": "<div>…6:00 pm show - …</div>"}}
+# Note it is NOT wp-admin/admin-ajax.php, which answers but ignores this action.
+LINEUP_API_URL = "https://www.comedycellar.com/lineup/api/"
+
+# The response does not echo the date back, so "shows present" only means "shows
+# for the date we asked about" if the endpoint actually honours the date. A date
+# this far out cannot legitimately have a lineup, so it is queried on every check
+# as a live trust test — see from_lineup_api.
+SENTINEL_OFFSET_DAYS = 300
 
 # The homepage is included because a target date may be announced there in prose;
 # it is deliberately NOT authoritative for the date-through (see AUTHORITATIVE_URLS)
@@ -43,8 +56,7 @@ REST_ENDPOINTS = [
     "https://www.comedycellar.com/wp-json/wp/v2/types",
 ]
 
-# admin-ajax action names this theme plausibly uses for the date picker.
-AJAX_ACTIONS = ["cc_get_shows", "get_shows", "get_lineup", "cc_lineup", "showtimes"]
+API_ACTION = "cc_get_shows"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -201,51 +213,71 @@ def from_rest(http, targets, today):
 # Strategy 3: admin-ajax date probes
 # --------------------------------------------------------------------------
 
-def probe_ajax_date(http, target, actions=AJAX_ACTIONS):
-    """Ask the site's own lineup endpoint about one date.
+def query_lineup_api(http, when, venue="newyork"):
+    """Ask the lineup endpoint about one date.
 
-    Returns (status, detail) where status is 'found' | 'negative' | 'unavailable'.
-    A 'found' requires the response to name the date AND contain showtimes, so a
-    generic 200 can't be mistaken for a real hit.
+    `when` is a date or a keyword the site accepts (e.g. "today").
+    Returns (reachable, text, detail) where text is the lineup fragment.
     """
-    for action in actions:
-        for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
-            payload = {
-                "action": action,
-                "json": json.dumps({
-                    "date": target.strftime(fmt), "venue": "newyork", "type": "lineup",
-                }),
-                "date": target.strftime(fmt),
-            }
-            status, text = http.post_form(AJAX_URL, payload)
-            body = (text or "").strip()
-            if status != 200 or body in ("", "0", "-1"):
-                continue
-            try:
-                doc = json.loads(body)
-            except ValueError:
-                continue
-            blob = clean_html(json.dumps(doc))
-            if text_mentions_date(blob, target) and SHOWTIME_RE.search(blob):
-                return "found", f"admin-ajax[{action}] returned shows for {target}"
-            if len(blob) > 200 or any(
-                    k in blob.lower() for k in ("show", "lineup", "comedian")):
-                return "negative", f"admin-ajax[{action}] answered, no shows"
-    return "unavailable", "admin-ajax gave nothing usable"
+    key = when if isinstance(when, str) else when.isoformat()
+    payload = {"action": API_ACTION,
+               "json": json.dumps({"date": key, "venue": venue, "type": "lineup"})}
+    status, text = http.post_form(LINEUP_API_URL, payload)
+    body = (text or "").strip()
+    if status != 200 or not body:
+        return False, "", f"HTTP {status}"
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return False, "", "non-JSON response"
+    fragment = ""
+    if isinstance(doc, dict):
+        show = doc.get("show")
+        if isinstance(show, dict):
+            fragment = show.get("html") or ""
+    if not fragment:
+        fragment = json.dumps(doc)
+    return True, clean_html(fragment), "ok"
 
 
-def from_ajax(http, targets, today):
-    s = Sighting("ajax", detail="admin-ajax")
-    details = []
+def has_shows(fragment):
+    return bool(SHOWTIME_RE.search(fragment))
+
+
+def from_lineup_api(http, targets, today):
+    """Query the site's own endpoint per target date.
+
+    Because the response never names the date it describes, this strategy first
+    proves the endpoint honours its date parameter at all: it asks for a date
+    ~10 months out, which cannot have a lineup. If that comes back with
+    showtimes, the endpoint is echoing something unrelated (probably today) and
+    every answer it gives is discarded rather than risk a false "tickets are up".
+    """
+    s = Sighting("lineup-api")
+    sentinel = today + timedelta(days=SENTINEL_OFFSET_DAYS)
+    reachable, fragment, detail = query_lineup_api(http, sentinel)
+    if not reachable:
+        s.detail = f"lineup-api unreachable ({detail})"
+        return [s]
+    s.ok = True
+    if has_shows(fragment):
+        s.detail = (f"lineup-api UNTRUSTWORTHY: sentinel {sentinel} returned "
+                    f"showtimes, so it ignores the date parameter — results dropped")
+        return [s]
+
+    results = []
     for t in targets:
-        status, detail = probe_ajax_date(http, t)
-        details.append(f"{t}:{status}")
-        if status in ("found", "negative"):
-            s.ok = True
-        if status == "found":
+        reachable, fragment, detail = query_lineup_api(http, t)
+        if not reachable:
+            results.append(f"{t}:{detail}")
+            continue
+        if has_shows(fragment):
             s.dates.add(t)
-            s.target_hits[t] = detail
-    s.detail = "admin-ajax " + ", ".join(details)
+            s.target_hits[t] = f"lineup API returned showtimes for {t}"
+            results.append(f"{t}:SHOWS")
+        else:
+            results.append(f"{t}:none")
+    s.detail = f"lineup-api (sentinel {sentinel} clean) " + ", ".join(results)
     return [s]
 
 
@@ -384,7 +416,7 @@ def from_browser(url, targets, today, settle_ms=3500, timeout_s=60):
 # --------------------------------------------------------------------------
 
 def discover(http, targets, today, static_urls=None, use_browser=True,
-             browser_url=LINEUP_URL, use_rest=True, use_ajax=True):
+             browser_url=LINEUP_URL, use_rest=False, use_api=True):
     """Run the strategies cheapest-first; the browser only if nothing else found a date.
 
     Returns (sightings, dates, target_hits).
@@ -392,8 +424,8 @@ def discover(http, targets, today, static_urls=None, use_browser=True,
     sightings = list(from_static(http, static_urls or DEFAULT_STATIC_URLS, targets, today))
     if use_rest:
         sightings += from_rest(http, targets, today)
-    if use_ajax:
-        sightings += from_ajax(http, targets, today)
+    if use_api:
+        sightings += from_lineup_api(http, targets, today)
 
     # Render only when no *authoritative* source produced a date. Gating on "any
     # date anywhere" would let one stray homepage date skip the render, which is

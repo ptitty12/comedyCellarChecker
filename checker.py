@@ -4,9 +4,9 @@
 Polls comedycellar.com and notifies the moment shows for the target dates
 (default: Sep 10/11/12, 2026) become bookable.
 
-Detection is layered (see sources.py): static HTML, WordPress REST, admin-ajax,
-and headless Chromium — needed because the lineup is rendered client-side, so raw
-HTML contains no dates at all.
+Detection is layered (see sources.py): static HTML, the site's own lineup API,
+and headless Chromium — the browser is needed because the lineup is rendered
+client-side, so raw HTML contains no dates at all.
 
 The invariant this service is built around: it must always know the furthest date
 the site lists ("date through"). If it can't work that out, that is an alarm in
@@ -32,7 +32,7 @@ import requests
 import sources
 from dateparse import (clean_html, extract_all_dates, horizon_of,  # noqa: F401
                        patterns_for_date, text_mentions_date)
-from sources import AJAX_URL, LINEUP_URL, RESERVATIONS_URL, HttpClient, discover
+from sources import LINEUP_URL, RESERVATIONS_URL, HttpClient, discover
 
 log = logging.getLogger("cellar")
 
@@ -61,8 +61,8 @@ class Config:
     startup_notify: bool = True
 
     use_browser: bool = True
-    use_rest: bool = True
-    use_ajax: bool = True
+    use_rest: bool = False   # wp-json probes all 404 on this site; kept for future
+    use_api: bool = True
 
     ntfy_server: str = "https://ntfy.sh"
     ntfy_topic: str = ""
@@ -107,8 +107,8 @@ def load_config() -> Config:
     cfg.heartbeat_hour = int(_env("HEARTBEAT_HOUR", "9"))
     cfg.startup_notify = _env("STARTUP_NOTIFY", "1") not in ("0", "false", "no")
     cfg.use_browser = _env("USE_BROWSER", "1") not in ("0", "false", "no")
-    cfg.use_rest = _env("USE_REST", "1") not in ("0", "false", "no")
-    cfg.use_ajax = _env("USE_AJAX", "1") not in ("0", "false", "no")
+    cfg.use_rest = _env("USE_REST", "0") not in ("0", "false", "no")
+    cfg.use_api = _env("USE_API", "1") not in ("0", "false", "no")
 
     cfg.ntfy_server = _env("NTFY_SERVER", cfg.ntfy_server).rstrip("/")
     cfg.ntfy_topic = _env("NTFY_TOPIC", "comedycellar-alerts-pt-7g3k1x")
@@ -176,7 +176,7 @@ def perform_check(cfg: Config, http, force_browser=False) -> CheckResult:
         static_urls=cfg.watch_urls,
         use_browser=cfg.use_browser,
         use_rest=cfg.use_rest,
-        use_ajax=cfg.use_ajax,
+        use_api=cfg.use_api,
     )
     if force_browser and not any(s.strategy == "browser" for s in sightings):
         extra = sources.from_browser(LINEUP_URL, cfg.targets, today)
@@ -655,6 +655,21 @@ def diagnose(cfg) -> int:
             if sample["post_data"]:
                 print(f"             request body: {sample['post_data']}")
             print(f"             response head: {sample['body_head']}")
+    # Control probes: prove the lineup API honours its date parameter, by asking
+    # for dates whose answers we already know. Without this, "shows present" for a
+    # target date could just be today's lineup echoed back.
+    print("-" * 72)
+    print("LINEUP API CONTROL PROBES (expect shows for today/near, none for far)")
+    for label, when in [("today", "today"),
+                        ("today+3", today + timedelta(days=3)),
+                        ("today+20", today + timedelta(days=20)),
+                        ("today+60", today + timedelta(days=60)),
+                        (f"today+{sources.SENTINEL_OFFSET_DAYS} (sentinel)",
+                         today + timedelta(days=sources.SENTINEL_OFFSET_DAYS))]:
+        reachable, fragment, detail = sources.query_lineup_api(http, when)
+        verdict = ("SHOWS" if sources.has_shows(fragment)
+                   else "no shows" if reachable else f"unreachable ({detail})")
+        print(f"  {label:28s} -> {verdict:12s} ({len(fragment)}B)")
     print("-" * 72)
     print("DATE THROUGH:",
           f"{res.horizon} (via {res.horizon_source})" if res.horizon

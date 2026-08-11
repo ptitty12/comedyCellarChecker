@@ -22,7 +22,8 @@ from checker import (CheckResult, Config, alert_body, enqueue, flush_pending,
                      perform_check, save_state, send_all, status_lines)
 from dateparse import (clean_html, extract_all_dates, horizon_of,
                        text_mentions_date)
-from sources import Sighting, from_browser, from_rest, from_static, probe_ajax_date
+from sources import (Sighting, from_browser, from_lineup_api, from_rest,
+                     from_static)
 
 SEP10, SEP11, SEP12 = date(2026, 9, 10), date(2026, 9, 11), date(2026, 9, 12)
 TARGETS = [SEP10, SEP11, SEP12]
@@ -78,9 +79,20 @@ class TestDateMatching(unittest.TestCase):
         self.assertIsNone(horizon_of(set(), TODAY))
 
 
+EMPTY_API = json.dumps({"show": {"html": ""}})
+
+
+def shows_api(html='<div class="set-header"><h2>7:00 pm show</h2></div>'):
+    """Shaped like the real response captured from the live site."""
+    return json.dumps({"show": {"html": html}})
+
+
 class FakeHttp:
-    def __init__(self, pages=None, ajax=None, json_urls=None):
-        self.pages, self.ajax, self.json_urls = pages or {}, ajax or {}, json_urls or {}
+    def __init__(self, pages=None, api=None, json_urls=None, api_default=None):
+        self.pages, self.api, self.json_urls = pages or {}, api or {}, json_urls or {}
+        # Unlisted dates answer like the real endpoint does for a date with no
+        # lineup yet — including the sentinel the trust guard queries.
+        self.api_default = api_default or (200, EMPTY_API)
 
     def get(self, url):
         return self.pages.get(url, (404, "nope"))
@@ -89,7 +101,8 @@ class FakeHttp:
         return self.json_urls.get(url, (404, ""))
 
     def post_form(self, url, data, referer=None):
-        return self.ajax.get(json.loads(data["json"])["date"], (200, "0"))
+        """Keyed by the requested date, mimicking the real lineup endpoint."""
+        return self.api.get(json.loads(data["json"])["date"], self.api_default)
 
     def reset(self):
         pass
@@ -136,16 +149,57 @@ class TestStrategies(unittest.TestCase):
                         TARGETS, TODAY)
         self.assertFalse(any(s.ok for s in out))
 
-    def test_ajax_found_requires_date_and_showtime(self):
-        good = json.dumps({"show": {"date": "2026-09-11", "html": "7:00 pm lineup"}})
-        self.assertEqual(probe_ajax_date(FakeHttp(ajax={"2026-09-11": (200, good)}),
-                                         SEP11)[0], "found")
+class TestLineupApi(unittest.TestCase):
+    """The endpoint never echoes the date, so the trust guard is load-bearing."""
 
-    def test_ajax_negative_and_unavailable(self):
-        neg = json.dumps({"shows": [], "note": "no shows scheduled for this date"})
-        self.assertEqual(probe_ajax_date(FakeHttp(ajax={"2026-09-10": (200, neg)}),
-                                         SEP10)[0], "negative")
-        self.assertEqual(probe_ajax_date(FakeHttp(), SEP10)[0], "unavailable")
+    def test_shows_for_a_target_is_a_hit(self):
+        http = FakeHttp(api={SEP11.isoformat(): (200, shows_api())})
+        s = from_lineup_api(http, TARGETS, TODAY)[0]
+        self.assertTrue(s.ok)
+        self.assertIn(SEP11, s.target_hits)
+        self.assertNotIn(SEP10, s.target_hits)
+
+    def test_empty_lineup_is_not_a_hit(self):
+        http = FakeHttp(api={t.isoformat(): (200, EMPTY_API) for t in TARGETS})
+        s = from_lineup_api(http, TARGETS, TODAY)[0]
+        self.assertTrue(s.ok)
+        self.assertEqual(s.target_hits, {})
+
+    def test_endpoint_that_ignores_the_date_is_distrusted(self):
+        """If a 300-day-out sentinel returns shows, every answer is discarded."""
+        # Every date, however absurd, answers with a lineup.
+        http = FakeHttp(api_default=(200, shows_api()))
+        s = from_lineup_api(http, TARGETS, TODAY)[0]
+        self.assertTrue(s.ok)
+        self.assertEqual(s.target_hits, {})     # would otherwise be 3 false alarms
+        self.assertEqual(s.dates, set())
+        self.assertIn("UNTRUSTWORTHY", s.detail)
+
+    def test_unreachable_endpoint_is_reported(self):
+        s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
+        self.assertFalse(s.ok)
+        self.assertIn("unreachable", s.detail)
+
+    def test_request_matches_the_captured_contract(self):
+        seen = {}
+
+        class Recorder(FakeHttp):
+            def post_form(self, url, data, referer=None):
+                seen["url"], seen["data"] = url, data
+                return 200, EMPTY_API
+
+        from_lineup_api(Recorder(), [SEP10], TODAY)
+        self.assertEqual(seen["url"], sources.LINEUP_API_URL)
+        self.assertEqual(seen["data"]["action"], "cc_get_shows")
+        self.assertEqual(json.loads(seen["data"]["json"]),
+                         {"date": SEP10.isoformat(), "venue": "newyork",
+                          "type": "lineup"})
+
+    def test_query_accepts_today_keyword(self):
+        http = FakeHttp(api={"today": (200, shows_api())})
+        reachable, fragment, _ = sources.query_lineup_api(http, "today")
+        self.assertTrue(reachable)
+        self.assertTrue(sources.has_shows(fragment))
 
 
 # Mirrors the real failure mode: no date appears anywhere in this HTML. The day
@@ -277,9 +331,17 @@ class TestDiscoveryOrchestration(unittest.TestCase):
         self.assertEqual(res.horizon_source, "browser")
 
     def test_no_strategy_works_means_unknown_horizon(self):
-        res = perform_check(make_cfg(watch_urls=["u"], use_browser=False), FakeHttp())
+        """Total blackout: pages 404 and the API is unreachable."""
+        res = perform_check(make_cfg(watch_urls=["u"], use_browser=False),
+                            FakeHttp(api_default=(0, "")))
         self.assertIsNone(res.horizon)
         self.assertFalse(res.ok)
+
+    def test_reachable_api_with_no_shows_still_leaves_horizon_unknown(self):
+        """A healthy API that reports no shows is not a date-through."""
+        res = perform_check(make_cfg(watch_urls=["u"], use_browser=False), FakeHttp())
+        self.assertTrue(res.ok)          # the endpoint answered
+        self.assertIsNone(res.horizon)   # but nothing tells us how far it lists
 
     def test_stray_homepage_date_cannot_suppress_the_browser(self):
         """A date in homepage copy must not skip the render nor set the horizon."""
