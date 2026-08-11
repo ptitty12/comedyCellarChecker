@@ -63,8 +63,15 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+# Playwright's on-disk layout differs by version: "Chrome for Testing" builds use
+# chrome-linux64/, older bundles use chrome-linux/. Both are matched so a version
+# bump can't silently disable the only strategy that can read this site.
 CHROMIUM_GLOBS = [
+    "/ms-playwright/chromium-*/chrome-linux64/chrome",
     "/ms-playwright/chromium-*/chrome-linux/chrome",
+    "/ms-playwright/chromium_headless_shell-*/chrome-linux64/chrome-headless-shell",
+    "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
+    "/opt/pw-browsers/chromium-*/chrome-linux64/chrome",
     "/opt/pw-browsers/chromium-*/chrome-linux/chrome",
 ]
 

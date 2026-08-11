@@ -13,11 +13,10 @@ RUN pip install -r requirements.txt \
     # The checker falls back to plain requests if this isn't installed.
     && (pip install 'curl_cffi>=0.6' || echo "curl_cffi unavailable, continuing")
 
-# Chromium is required: the lineup is rendered client-side, so the raw HTML
-# contains no dates at all. Kept non-fatal so a transient mirror outage can't
-# break a deploy — the watcher reports loudly if the browser is missing.
-RUN (playwright install --with-deps chromium && chmod -R a+rX /ms-playwright) \
-    || echo "WARNING: chromium install failed; browser strategy will be unavailable"
+# Chromium is required, not optional: the lineup is rendered client-side, so the
+# raw HTML contains no dates at all. A build that skipped this would deploy a
+# watcher that can never see a date, so let the build fail instead.
+RUN playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
 
 COPY dateparse.py sources.py checker.py ./
 

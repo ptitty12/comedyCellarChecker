@@ -27,5 +27,7 @@ jobs:
       - run: docker build -t comedy-cellar-checker .
       - name: Notification pipeline works in the image
         run: docker run --rm -e DRY_RUN=1 -e STATE_FILE=/tmp/state.json comedy-cellar-checker python checker.py --test-notify
-      - name: Chromium is present in the image
-        run: docker run --rm comedy-cellar-checker python -c "import sources; p=sources.chromium_path(); print('chromium:', p); assert p, 'chromium missing from image'"
+      # Asserts the capability, not the path: launches Chromium inside the image
+      # and reads a DOM back. A blind image must never pass CI.
+      - name: Chromium can render inside the image
+        run: docker run --rm comedy-cellar-checker python checker.py --selfcheck

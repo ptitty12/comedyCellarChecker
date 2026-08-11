@@ -632,6 +632,45 @@ def test_notify(cfg) -> int:
     return 0 if ok else 1
 
 
+def selfcheck(cfg) -> int:
+    """Prove this deployment can actually render a page.
+
+    Checks the capability, not the plumbing: Chromium is launched and a DOM is
+    read back. Path detection returning nothing is fine — Playwright resolves its
+    own bundle — so only a failed launch is a failure.
+    """
+    print("chromium path:", sources.chromium_path() or "(playwright default resolution)")
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        print(f"SELFCHECK FAILED: playwright not importable: {exc}")
+        return 1
+    try:
+        with sync_playwright() as p:
+            launch = {"args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]}
+            exe = sources.chromium_path()
+            if exe:
+                launch["executable_path"] = exe
+            browser = p.chromium.launch(**launch)
+            try:
+                page = browser.new_page()
+                page.set_content('<select><option value="2026-09-10">x</option></select>')
+                got = page.eval_on_selector_all(
+                    "option", "els => els.map(e => e.getAttribute('value'))")
+            finally:
+                browser.close()
+    except Exception as exc:
+        print(f"SELFCHECK FAILED: chromium could not launch: "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+    if got != ["2026-09-10"]:
+        print(f"SELFCHECK FAILED: unexpected DOM read: {got!r}")
+        return 1
+    print("chromium rendered and DOM read back:", got)
+    print("SELFCHECK OK — this deployment can read the JS-rendered lineup")
+    return 0
+
+
 def diagnose(cfg) -> int:
     """Full transparency dump: what every strategy saw. Run this on the VPS."""
     http = HttpClient()
@@ -688,6 +727,8 @@ def main():
     p.add_argument("--test-notify", action="store_true", help="test every channel")
     p.add_argument("--diagnose", action="store_true",
                    help="dump what every detection strategy sees")
+    p.add_argument("--selfcheck", action="store_true",
+                   help="verify this deployment can launch Chromium and read a DOM")
     p.add_argument("--health", action="store_true", help="container healthcheck")
     args = p.parse_args()
 
@@ -696,6 +737,8 @@ def main():
         sys.exit(health(cfg))
     if args.test_notify:
         sys.exit(test_notify(cfg))
+    if args.selfcheck:
+        sys.exit(selfcheck(cfg))
     if args.diagnose:
         sys.exit(diagnose(cfg))
 

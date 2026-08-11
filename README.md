@@ -21,21 +21,34 @@ tickets appear and nobody gets told.
 
 Every check runs these, cheapest first, and stops early once dates are found:
 
-1. **Static HTML** — fetches the lineup, both reservation slugs, and the
+1. **Static HTML** — fetches the lineup page, the reservations page and the
    homepage; matches target dates in every format a site plausibly writes
    (`2026-09-10`, `20260910`, `9/10/2026`, `September 10`, `Sept 10th`,
    `value="…"` picker attributes, embedded JSON). Wrong-year matches like
-   "September 10, 2025" are excluded.
-2. **WordPress / plugin REST** — tries The Events Calendar and custom
-   post-type endpoints under `/wp-json/`, which would expose dates server-side.
-3. **admin-ajax probes** — asks the theme's lineup endpoint about each target
-   date across several plausible action names. A hit requires the response to
-   both name the date *and* contain showtimes, so a generic `200` can't be
-   mistaken for tickets going live.
-4. **Headless Chromium** — renders the page like a real browser, then harvests
-   dates from the live DOM *and* from every XHR/JSON payload the page fetched.
-   This is the strategy that actually works on this site. It also records the
-   endpoints the page really calls, so detection can be made cheaper later.
+   "September 10, 2025" are excluded. On this site it currently finds nothing —
+   kept because it costs one request and would catch a prose announcement.
+2. **The site's own lineup API** — the endpoint the date picker calls, captured
+   from a real browser session:
+
+   ```
+   POST https://www.comedycellar.com/lineup/api/
+   action=cc_get_shows&json={"date":"2026-09-10","venue":"newyork","type":"lineup"}
+   → {"show":{"html":"<…6:00 pm show - …>"}}
+   ```
+
+   The response never names the date it describes, so "shows present" only means
+   "shows for the date we asked for" if the endpoint honours its `date`
+   parameter. Every check therefore first asks for a date ~10 months out, which
+   cannot have a lineup. If *that* comes back with showtimes, the endpoint is
+   echoing something unrelated and **all of its answers are discarded** rather
+   than fire a false "tickets are up". This guard is tested.
+3. **Headless Chromium** — renders the page like a real browser, then harvests
+   dates from the live DOM *and* from every same-origin XHR payload. This is
+   what establishes the date-through on this site, and what discovered the API
+   above. Runs only when no authoritative source produced a date.
+4. **WordPress REST** (`USE_REST=1`, off by default) — `/wp-json/` probes for
+   The Events Calendar and custom post types. All four 404 here; kept for the
+   day the site changes.
 
 ## How you get told
 
@@ -112,7 +125,8 @@ changed.
 | `HORIZON_STALL_DAYS` | `3` | Days of a frozen date-through before alarming |
 | `FAILURE_ALERT_HOURS` | `2` | Hours of total unreachability before alarming |
 | `HEARTBEAT_HOUR` | `9` | Local hour for the daily heartbeat; `-1` disables |
-| `USE_BROWSER` / `USE_REST` / `USE_AJAX` | `1` | Toggle individual strategies |
+| `USE_BROWSER` / `USE_API` | `1` | Toggle the Chromium render / lineup API strategies |
+| `USE_REST` | `0` | Enable the `/wp-json/` probes (all 404 today) |
 | `CHROMIUM_PATH` | – | Explicit Chromium binary (auto-detected otherwise) |
 | `TZ` | `America/New_York` | Timezone for heartbeat scheduling |
 | `STATE_FILE` | `/data/state.json` | State location (mount a volume here) |
