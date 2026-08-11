@@ -1,0 +1,28 @@
+name: Diagnose live site
+
+# Runs the detection strategies against the real comedycellar.com and prints
+# what each one sees, including the "date through". Useful because a dev sandbox
+# often can't reach the site, and because it verifies detection still works
+# after the site changes. Read-only: a handful of GETs to public pages.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 13 * * *"   # 09:17 ET daily, as an early warning of site changes
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      - name: Diagnose
+        env:
+          DRY_RUN: "1"
+          NTFY_TOPIC: "off"
+          STATE_FILE: /tmp/state.json
+          LOG_LEVEL: INFO
+        run: python checker.py --diagnose

@@ -1,0 +1,381 @@
+"""Where dates come from.
+
+Four independent strategies, tried cheapest-first. Any one of them producing a
+date is enough; the browser strategy exists because comedycellar.com renders its
+lineup client-side, so raw HTML contains no dates at all.
+
+Every strategy returns a Sighting so the caller can report exactly which ones
+worked — a checker that can't say where its data came from can't be trusted.
+"""
+
+import glob
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+
+import requests
+
+from dateparse import clean_html, extract_all_dates, text_mentions_date, SHOWTIME_RE
+
+log = logging.getLogger("cellar.sources")
+
+LINEUP_URL = "https://www.comedycellar.com/new-york-line-up/"
+RESERVATIONS_URL = "https://www.comedycellar.com/reservations-newyork/"
+AJAX_URL = "https://www.comedycellar.com/wp-admin/admin-ajax.php"
+
+# Both reservation slugs are tried: the site has used each at different times.
+DEFAULT_STATIC_URLS = [
+    LINEUP_URL,
+    RESERVATIONS_URL,
+    "https://www.comedycellar.com/reservations-new-york/",
+    "https://www.comedycellar.com/",
+]
+
+# WordPress/plugin JSON endpoints that would expose show dates server-side.
+REST_ENDPOINTS = [
+    "https://www.comedycellar.com/wp-json/tribe/events/v1/events?per_page=50&start_date={start}",
+    "https://www.comedycellar.com/wp-json/wp/v2/shows?per_page=50",
+    "https://www.comedycellar.com/wp-json/wp/v2/lineup?per_page=50",
+    "https://www.comedycellar.com/wp-json/wp/v2/types",
+]
+
+# admin-ajax action names this theme plausibly uses for the date picker.
+AJAX_ACTIONS = ["cc_get_shows", "get_shows", "get_lineup", "cc_lineup", "showtimes"]
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+CHROMIUM_GLOBS = [
+    "/ms-playwright/chromium-*/chrome-linux/chrome",
+    "/opt/pw-browsers/chromium-*/chrome-linux/chrome",
+]
+
+
+@dataclass
+class Sighting:
+    strategy: str
+    ok: bool = False
+    detail: str = ""
+    dates: set = field(default_factory=set)
+    target_hits: dict = field(default_factory=dict)
+    xhr_urls: list = field(default_factory=list)
+
+    def scan(self, text, targets, today):
+        """Pull every date out of a blob, and note which targets it proves."""
+        cleaned = clean_html(text)
+        self.dates |= extract_all_dates(cleaned, today)
+        for t in targets:
+            if text_mentions_date(cleaned, t):
+                self.target_hits.setdefault(t, self.detail or self.strategy)
+
+
+class HttpClient:
+    """requests, upgraded to a browser TLS fingerprint when curl_cffi is present."""
+
+    def __init__(self):
+        self._curl_ok = False
+        try:
+            from curl_cffi import requests as curl_requests
+            self._curl_requests = curl_requests
+            self._curl_ok = True
+        except Exception:
+            self._curl_requests = None
+        self.reset()
+
+    def reset(self):
+        try:
+            if self._curl_ok:
+                self._session = self._curl_requests.Session(impersonate="chrome")
+            else:
+                self._session = requests.Session()
+        except Exception as exc:
+            log.warning("curl_cffi session failed (%s); using requests", exc)
+            self._curl_ok = False
+            self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+
+    def _request(self, method, url, **kw):
+        kw.setdefault("timeout", 30)
+        last = None
+        for attempt in (1, 2):
+            try:
+                r = self._session.request(method, url, **kw)
+                return r.status_code, r.text or ""
+            except Exception as exc:
+                last = exc
+                if self._curl_ok:
+                    log.warning("curl_cffi failed (%s); switching to requests", exc)
+                    self._curl_ok = False
+                    self.reset()
+                elif attempt == 1:
+                    time.sleep(2)
+                    self.reset()
+        log.warning("%s %s failed: %s", method, url, last)
+        return 0, ""
+
+    def get(self, url):
+        return self._request("GET", url, headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+
+    def get_json(self, url):
+        return self._request("GET", url, headers={"Accept": "application/json, */*"})
+
+    def post_form(self, url, data, referer=LINEUP_URL):
+        return self._request("POST", url, data=data, headers={
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://www.comedycellar.com",
+            "Referer": referer,
+        })
+
+
+# --------------------------------------------------------------------------
+# Strategy 1: static HTML
+# --------------------------------------------------------------------------
+
+def from_static(http, urls, targets, today):
+    out = []
+    for url in urls:
+        s = Sighting("static", detail=f"static {url}")
+        status, text = http.get(url)
+        if status == 200 and len(text) > 3000:
+            s.ok = True
+            s.scan(text, targets, today)
+            s.detail = f"static {url} ({len(text)}B, {len(s.dates)} dates)"
+        else:
+            s.detail = f"static {url} -> HTTP {status}, {len(text or '')}B"
+        out.append(s)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Strategy 2: WordPress / plugin REST APIs
+# --------------------------------------------------------------------------
+
+def from_rest(http, targets, today):
+    out = []
+    start = today.isoformat()
+    for tmpl in REST_ENDPOINTS:
+        url = tmpl.format(start=start)
+        s = Sighting("rest", detail=f"rest {url.split('/wp-json/')[-1][:48]}")
+        status, text = http.get_json(url)
+        if status == 200 and text.strip().startswith(("{", "[")):
+            try:
+                json.loads(text)
+            except ValueError:
+                s.detail += " -> non-JSON body"
+                out.append(s)
+                continue
+            s.ok = True
+            s.scan(text, targets, today)
+            s.detail += f" -> 200, {len(s.dates)} dates"
+        else:
+            s.detail += f" -> HTTP {status}"
+        out.append(s)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Strategy 3: admin-ajax date probes
+# --------------------------------------------------------------------------
+
+def probe_ajax_date(http, target, actions=AJAX_ACTIONS):
+    """Ask the site's own lineup endpoint about one date.
+
+    Returns (status, detail) where status is 'found' | 'negative' | 'unavailable'.
+    A 'found' requires the response to name the date AND contain showtimes, so a
+    generic 200 can't be mistaken for a real hit.
+    """
+    for action in actions:
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+            payload = {
+                "action": action,
+                "json": json.dumps({
+                    "date": target.strftime(fmt), "venue": "newyork", "type": "lineup",
+                }),
+                "date": target.strftime(fmt),
+            }
+            status, text = http.post_form(AJAX_URL, payload)
+            body = (text or "").strip()
+            if status != 200 or body in ("", "0", "-1"):
+                continue
+            try:
+                doc = json.loads(body)
+            except ValueError:
+                continue
+            blob = clean_html(json.dumps(doc))
+            if text_mentions_date(blob, target) and SHOWTIME_RE.search(blob):
+                return "found", f"admin-ajax[{action}] returned shows for {target}"
+            if len(blob) > 200 or any(
+                    k in blob.lower() for k in ("show", "lineup", "comedian")):
+                return "negative", f"admin-ajax[{action}] answered, no shows"
+    return "unavailable", "admin-ajax gave nothing usable"
+
+
+def from_ajax(http, targets, today):
+    s = Sighting("ajax", detail="admin-ajax")
+    details = []
+    for t in targets:
+        status, detail = probe_ajax_date(http, t)
+        details.append(f"{t}:{status}")
+        if status in ("found", "negative"):
+            s.ok = True
+        if status == "found":
+            s.dates.add(t)
+            s.target_hits[t] = detail
+    s.detail = "admin-ajax " + ", ".join(details)
+    return [s]
+
+
+# --------------------------------------------------------------------------
+# Strategy 4: headless Chromium (renders the JS the other strategies can't see)
+# --------------------------------------------------------------------------
+
+HARVEST_JS = """els => els.map(e => [
+    e.getAttribute('value'), e.getAttribute('data-date'), e.getAttribute('data-day'),
+    e.getAttribute('datetime'), e.getAttribute('href'), e.textContent
+].filter(Boolean).join(' '))"""
+
+HARVEST_SELECTOR = (
+    "option,[value],[data-date],[data-day],[datetime],time,a[href*='date'],"
+    ".date,.day,.show-date,[class*='date'],[class*='day']"
+)
+
+
+def chromium_path():
+    """An explicit Chromium binary, or None to let Playwright resolve its own.
+
+    Globbed rather than pinned so a Playwright version bump doesn't silently
+    disable the only strategy that can read this site.
+    """
+    override = os.environ.get("CHROMIUM_PATH", "")
+    if override and os.path.exists(override):
+        return override
+    for pattern in CHROMIUM_GLOBS:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def from_browser(url, targets, today, settle_ms=3500, timeout_s=60):
+    """Render the page, then harvest the DOM *and* every JSON/XHR payload it fetched.
+
+    The XHR bodies are the real prize: they are the show data itself, and their
+    URLs tell us the endpoint the site actually uses.
+    """
+    s = Sighting("browser", detail=f"browser {url}")
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        s.detail = f"browser unavailable: playwright not importable ({exc})"
+        return [s]
+
+    bodies, xhr_urls = [], []
+
+    def on_response(resp):
+        try:
+            ct = (resp.headers or {}).get("content-type", "")
+            if not any(k in ct for k in ("json", "javascript", "text/html")):
+                return
+            if resp.request.resource_type not in ("xhr", "fetch"):
+                return
+            xhr_urls.append(f"{resp.request.method} {resp.url} [{resp.status}]")
+            body = resp.text()
+            if body and len(body) < 2_000_000:
+                bodies.append(body)
+        except Exception:
+            pass  # a body that can't be read is not worth failing the render over
+
+    nav_status, nav_error = None, ""
+    try:
+        with sync_playwright() as p:
+            launch = {"args": ["--no-sandbox", "--disable-dev-shm-usage",
+                               "--disable-gpu"]}
+            exe = chromium_path()
+            if exe:
+                launch["executable_path"] = exe
+            browser = p.chromium.launch(**launch)
+            try:
+                page = browser.new_page(user_agent=USER_AGENT,
+                                        viewport={"width": 1400, "height": 1000})
+                page.on("response", on_response)
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded",
+                                     timeout=timeout_s * 1000)
+                    nav_status = resp.status if resp else None
+                except Exception as exc:
+                    nav_error = f"{type(exc).__name__}: {exc}".splitlines()[0]
+                    log.warning("browser goto failed: %s", nav_error)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=12000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(settle_ms)
+
+                html_text = page.content()
+                try:
+                    extras = page.eval_on_selector_all(HARVEST_SELECTOR, HARVEST_JS)
+                except Exception:
+                    extras = []
+                try:
+                    body_text = page.inner_text("body")[:400_000]
+                except Exception:
+                    body_text = ""
+            finally:
+                browser.close()
+    except Exception as exc:
+        s.detail = f"browser failed: {type(exc).__name__}: {exc}"
+        return [s]
+
+    # A failed navigation still yields a big DOM — Chromium's own error page — so
+    # success is judged on the navigation response, never on document size.
+    if nav_status is None or nav_status >= 400:
+        s.detail = (f"browser {url} -> navigation failed "
+                    f"({nav_error or f'HTTP {nav_status}'})")
+        return [s]
+
+    blob = "\n".join([html_text, body_text, "\n".join(extras), "\n".join(bodies)])
+    s.ok = len(html_text) > 500
+    s.xhr_urls = xhr_urls
+    s.scan(blob, targets, today)
+    s.detail = (f"browser {url} (HTTP {nav_status}, dom {len(html_text)}B, "
+                f"{len(extras)} nodes, {len(bodies)} xhr payloads, {len(s.dates)} dates)")
+    return [s]
+
+
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+
+def discover(http, targets, today, static_urls=None, use_browser=True,
+             browser_url=LINEUP_URL, use_rest=True, use_ajax=True):
+    """Run the strategies cheapest-first; the browser only if nothing else found a date.
+
+    Returns (sightings, dates, target_hits).
+    """
+    sightings = list(from_static(http, static_urls or DEFAULT_STATIC_URLS, targets, today))
+    if use_rest:
+        sightings += from_rest(http, targets, today)
+    if use_ajax:
+        sightings += from_ajax(http, targets, today)
+
+    cheap_dates = set().union(*(s.dates for s in sightings)) if sightings else set()
+    if use_browser and not cheap_dates:
+        sightings += from_browser(browser_url, targets, today)
+
+    dates, hits = set(), {}
+    for s in sightings:
+        dates |= s.dates
+        for d, ev in s.target_hits.items():
+            hits.setdefault(d, []).append(ev)
+    return sightings, dates, hits

@@ -13,11 +13,19 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      # REQUIRE_BROWSER makes the headless-Chromium tests fail rather than skip,
+      # so the one strategy that can read this site is always exercised.
       - run: python -m unittest test_checker -v
+        env:
+          REQUIRE_BROWSER: "1"
 
   docker-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t comedy-cellar-checker .
-      - run: docker run --rm -e DRY_RUN=1 -e STATE_FILE=/tmp/state.json comedy-cellar-checker python checker.py --test-notify
+      - name: Notification pipeline works in the image
+        run: docker run --rm -e DRY_RUN=1 -e STATE_FILE=/tmp/state.json comedy-cellar-checker python checker.py --test-notify
+      - name: Chromium is present in the image
+        run: docker run --rm comedy-cellar-checker python -c "import sources; p=sources.chromium_path(); print('chromium:', p); assert p, 'chromium missing from image'"

@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """Comedy Cellar ticket watcher.
 
-Polls comedycellar.com and sends notifications the moment shows for the
-target dates (default: Sep 10/11/12, 2026) become visible anywhere on the
-lineup/reservation pages or via the site's lineup AJAX API.
+Polls comedycellar.com and notifies the moment shows for the target dates
+(default: Sep 10/11/12, 2026) become bookable.
 
-Designed to run forever inside a container:
-  - two independent detection strategies (page scan + WordPress admin-ajax API)
-  - notification fan-out to every configured channel with retries and a
-    persistent queue (an alert is never dropped, it is retried until delivered)
-  - repeat reminders per found date so one missed push can't lose the window
-  - failure watchdog: if the site can't be checked for a while you get told,
-    so silence never means "nothing happened"
-  - daily heartbeat so you know it is alive
+Detection is layered (see sources.py): static HTML, WordPress REST, admin-ajax,
+and headless Chromium — needed because the lineup is rendered client-side, so raw
+HTML contains no dates at all.
+
+The invariant this service is built around: it must always know the furthest date
+the site lists ("date through"). If it can't work that out, that is an alarm in
+its own right, because it means the watcher has gone blind without failing.
 """
 
 import argparse
-import html
 import json
 import logging
 import os
 import random
-import re
 import signal
 import smtplib
 import sys
@@ -33,40 +29,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import sources
+from dateparse import (clean_html, extract_all_dates, horizon_of,  # noqa: F401
+                       patterns_for_date, text_mentions_date)
+from sources import AJAX_URL, LINEUP_URL, RESERVATIONS_URL, HttpClient, discover
+
 log = logging.getLogger("cellar")
 
-LINEUP_URL = "https://www.comedycellar.com/new-york-line-up/"
-RESERVATIONS_URL = "https://www.comedycellar.com/reservations-new-york/"
-AJAX_URL = "https://www.comedycellar.com/wp-admin/admin-ajax.php"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-MONTH_NAMES = {
-    1: ["january", "jan"], 2: ["february", "feb"], 3: ["march", "mar"],
-    4: ["april", "apr"], 5: ["may"], 6: ["june", "jun"],
-    7: ["july", "jul"], 8: ["august", "aug"],
-    9: ["september", "sept", "sep"],
-    10: ["october", "oct"], 11: ["november", "nov"], 12: ["december", "dec"],
-}
-
-ALL_MONTHS_ALT = "|".join(
-    sorted((n for names in MONTH_NAMES.values() for n in names), key=len, reverse=True)
-)
-ISO_ANY_RE = re.compile(r"(?<!\d)(20\d{2})-(\d{2})-(\d{2})(?!\d)")
-MDY_ANY_RE = re.compile(
-    rf"\b({ALL_MONTHS_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s*(20\d{{2}}))?\b",
-    re.IGNORECASE,
-)
-SHOWTIME_RE = re.compile(r"\b\d{1,2}[:.]\d{2}\s*(?:pm|am)\b", re.IGNORECASE)
-MONTH_BY_NAME = {n: num for num, names in MONTH_NAMES.items() for n in names}
-
-
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
 
 def _env(name, default):
     v = os.environ.get(name)
@@ -76,21 +45,25 @@ def _env(name, default):
 @dataclass
 class Config:
     targets: list = field(default_factory=list)
-    watch_urls: list = field(default_factory=lambda: [LINEUP_URL, RESERVATIONS_URL])
+    watch_urls: list = field(default_factory=lambda: list(sources.DEFAULT_STATIC_URLS))
     check_interval: int = 300
     tick_seconds: int = 25
     state_file: str = "/data/state.json"
     tz: str = "America/New_York"
 
-    # alert behaviour
-    alert_repeats: int = 3            # reminders after the first alert, per date
+    alert_repeats: int = 3
     alert_repeat_minutes: int = 30
-    failure_alert_hours: float = 2.0  # warn when the site is uncheckable this long
+    failure_alert_hours: float = 2.0
     failure_realert_hours: float = 12.0
-    heartbeat_hour: int = 9           # local hour for the daily heartbeat, -1 = off
+    horizon_unknown_hours: float = 1.0
+    horizon_stall_days: float = 3.0
+    heartbeat_hour: int = 9
     startup_notify: bool = True
 
-    # channels
+    use_browser: bool = True
+    use_rest: bool = True
+    use_ajax: bool = True
+
     ntfy_server: str = "https://ntfy.sh"
     ntfy_topic: str = ""
     ntfy_token: str = ""
@@ -112,16 +85,13 @@ class Config:
 
 def load_config() -> Config:
     cfg = Config()
-    raw = _env("TARGET_DATES", "2026-09-10,2026-09-11,2026-09-12")
-    for part in raw.split(","):
-        part = part.strip()
-        if part:
-            cfg.targets.append(datetime.strptime(part, "%Y-%m-%d").date())
+    for part in _env("TARGET_DATES", "2026-09-10,2026-09-11,2026-09-12").split(","):
+        if part.strip():
+            cfg.targets.append(datetime.strptime(part.strip(), "%Y-%m-%d").date())
     if not cfg.targets:
         raise SystemExit("TARGET_DATES is empty")
 
-    extra = _env("EXTRA_WATCH_URLS", "")
-    for u in extra.split(","):
+    for u in _env("EXTRA_WATCH_URLS", "").split(","):
         if u.strip():
             cfg.watch_urls.append(u.strip())
 
@@ -132,8 +102,13 @@ def load_config() -> Config:
     cfg.alert_repeat_minutes = int(_env("ALERT_REPEAT_MINUTES", "30"))
     cfg.failure_alert_hours = float(_env("FAILURE_ALERT_HOURS", "2"))
     cfg.failure_realert_hours = float(_env("FAILURE_REALERT_HOURS", "12"))
+    cfg.horizon_unknown_hours = float(_env("HORIZON_UNKNOWN_HOURS", "1"))
+    cfg.horizon_stall_days = float(_env("HORIZON_STALL_DAYS", "3"))
     cfg.heartbeat_hour = int(_env("HEARTBEAT_HOUR", "9"))
     cfg.startup_notify = _env("STARTUP_NOTIFY", "1") not in ("0", "false", "no")
+    cfg.use_browser = _env("USE_BROWSER", "1") not in ("0", "false", "no")
+    cfg.use_rest = _env("USE_REST", "1") not in ("0", "false", "no")
+    cfg.use_ajax = _env("USE_AJAX", "1") not in ("0", "false", "no")
 
     cfg.ntfy_server = _env("NTFY_SERVER", cfg.ntfy_server).rstrip("/")
     cfg.ntfy_topic = _env("NTFY_TOPIC", "comedycellar-alerts-pt-7g3k1x")
@@ -158,225 +133,76 @@ def load_config() -> Config:
 
 
 # --------------------------------------------------------------------------
-# HTTP client: curl_cffi (browser TLS fingerprint) when available, else requests
-# --------------------------------------------------------------------------
-
-class HttpClient:
-    def __init__(self):
-        self._curl_ok = False
-        self._session = None
-        try:
-            from curl_cffi import requests as curl_requests  # noqa: F401
-            self._curl_requests = curl_requests
-            self._curl_ok = True
-        except Exception:
-            self._curl_requests = None
-        self.reset()
-
-    def reset(self):
-        try:
-            if self._curl_ok:
-                self._session = self._curl_requests.Session(impersonate="chrome")
-            else:
-                self._session = requests.Session()
-        except Exception as exc:
-            log.warning("curl_cffi session failed (%s); falling back to requests", exc)
-            self._curl_ok = False
-            self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-
-    def _request(self, method, url, **kw):
-        kw.setdefault("timeout", 30)
-        last_exc = None
-        for attempt in (1, 2):
-            try:
-                resp = self._session.request(method, url, **kw)
-                return resp.status_code, resp.text or ""
-            except Exception as exc:
-                last_exc = exc
-                if self._curl_ok:
-                    # curl_cffi acting up -> permanently fall back to requests
-                    log.warning("curl_cffi request failed (%s); switching to requests", exc)
-                    self._curl_ok = False
-                    self.reset()
-                elif attempt == 1:
-                    time.sleep(2)
-                    self.reset()
-        log.warning("%s %s failed: %s", method, url, last_exc)
-        return 0, ""
-
-    def get(self, url):
-        return self._request("GET", url, headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
-
-    def post_form(self, url, data, referer):
-        return self._request("POST", url, data=data, headers={
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://www.comedycellar.com",
-            "Referer": referer,
-        })
-
-
-# --------------------------------------------------------------------------
-# Date detection
-# --------------------------------------------------------------------------
-
-def patterns_for_date(d: date):
-    """Regexes matching this exact date in the formats sites actually use."""
-    name_alt = "|".join(sorted(MONTH_NAMES[d.month], key=len, reverse=True))
-    yy = d.year % 100
-    pats = [
-        rf"(?<!\d){d.year}-{d.month:02d}-{d.day:02d}(?!\d)",
-        rf"(?<!\d){d.year}/{d.month:02d}/{d.day:02d}(?!\d)",
-        rf"(?<!\d)0?{d.month}[/\-.]0?{d.day}[/\-.](?:{d.year}|{yy:02d})(?!\d)",
-        # "September 10" / "Sep 10th" / "September 10, 2026" — but not another year
-        rf"\b(?:{name_alt})\.?\s+0?{d.day}(?:st|nd|rd|th)?\b(?!\s*,?\s*(?!{d.year})20\d\d)",
-    ]
-    return [re.compile(p, re.IGNORECASE) for p in pats]
-
-
-def clean_html(text: str) -> str:
-    text = html.unescape(text)
-    return text.replace("\xa0", " ").replace("\\/", "/")
-
-
-def text_mentions_date(text: str, d: date) -> bool:
-    return any(p.search(text) for p in patterns_for_date(d))
-
-
-def extract_all_dates(text: str, today: date):
-    """Every plausible near-future date mentioned in the text (for the heartbeat)."""
-    found = set()
-    lo, hi = today - timedelta(days=2), today + timedelta(days=400)
-
-    def keep(y, m, dd):
-        try:
-            val = date(y, m, dd)
-        except ValueError:
-            return
-        if lo <= val <= hi:
-            found.add(val)
-
-    for y, m, dd in ISO_ANY_RE.findall(text):
-        keep(int(y), int(m), int(dd))
-    for name, dd, y in MDY_ANY_RE.findall(text):
-        m = MONTH_BY_NAME.get(name.lower())
-        if not m:
-            continue
-        if y:
-            keep(int(y), m, int(dd))
-        else:
-            for year in (today.year, today.year + 1):
-                try:
-                    val = date(year, m, int(dd))
-                except ValueError:
-                    continue
-                if lo <= val <= hi:
-                    found.add(val)
-                    break
-    return found
-
-
-# --------------------------------------------------------------------------
-# Site checking
+# Checking
 # --------------------------------------------------------------------------
 
 @dataclass
 class CheckResult:
-    found: dict = field(default_factory=dict)   # date -> list of evidence strings
-    confirmed: set = field(default_factory=set)  # dates confirmed via the AJAX API
+    found: dict = field(default_factory=dict)
     all_dates: set = field(default_factory=set)
-    pages_ok: int = 0
-    api_alive: bool = False
-    errors: list = field(default_factory=list)
+    horizon: object = None
+    horizon_source: str = ""
+    sightings: list = field(default_factory=list)
 
     @property
     def ok(self):
-        return self.pages_ok > 0 or self.api_alive
+        return any(s.ok for s in self.sightings)
+
+    @property
+    def errors(self):
+        return [s.detail for s in self.sightings if not s.ok]
+
+    @property
+    def working(self):
+        return [s.strategy for s in self.sightings if s.ok and s.dates]
+
+    @property
+    def xhr_urls_sample(self):
+        """Endpoints the rendered page actually called — recorded so a future
+        version can poll them directly instead of launching a browser."""
+        out = []
+        for s in self.sightings:
+            out += s.xhr_urls
+        return out[:20]
 
     def add(self, d, evidence):
         self.found.setdefault(d, []).append(evidence)
 
 
-def probe_ajax(http: HttpClient, target: date):
-    """Ask the site's own lineup API about one date.
-
-    Returns (status, detail): status is 'found' | 'negative' | 'unavailable'.
-    """
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
-        payload = {
-            "action": "cc_get_shows",
-            "json": json.dumps({
-                "date": target.strftime(fmt),
-                "venue": "newyork",
-                "type": "lineup",
-            }),
-        }
-        status, text = http.post_form(AJAX_URL, payload, LINEUP_URL)
-        body = (text or "").strip()
-        if status != 200 or not body or body == "0" or body == "-1":
-            continue
-        try:
-            doc = json.loads(body)
-        except ValueError:
-            continue
-        blob = clean_html(json.dumps(doc))
-        has_date = text_mentions_date(blob, target)
-        has_times = bool(SHOWTIME_RE.search(blob))
-        if has_date and has_times:
-            return "found", f"lineup API returned shows for {target.isoformat()}"
-        lower = blob.lower()
-        if len(blob) > 200 or any(k in lower for k in ("show", "lineup", "comedian")):
-            return "negative", "api answered, no shows for this date"
-    return "unavailable", "api did not answer usefully"
-
-
-def perform_check(cfg: Config, http: HttpClient, skip_api_for=frozenset()) -> CheckResult:
-    res = CheckResult()
+def perform_check(cfg: Config, http, force_browser=False) -> CheckResult:
     today = datetime.now(ZoneInfo(cfg.tz)).date()
+    sightings, dates, hits = discover(
+        http, cfg.targets, today,
+        static_urls=cfg.watch_urls,
+        use_browser=cfg.use_browser,
+        use_rest=cfg.use_rest,
+        use_ajax=cfg.use_ajax,
+    )
+    if force_browser and not any(s.strategy == "browser" for s in sightings):
+        extra = sources.from_browser(LINEUP_URL, cfg.targets, today)
+        sightings += extra
+        for s in extra:
+            dates |= s.dates
+            for d, ev in s.target_hits.items():
+                hits.setdefault(d, []).append(ev)
 
-    for url in cfg.watch_urls:
-        status, text = http.get(url)
-        if status == 200 and text and len(text) > 3000:
-            res.pages_ok += 1
-            cleaned = clean_html(text)
-            res.all_dates |= extract_all_dates(cleaned, today)
-            for target in cfg.targets:
-                if text_mentions_date(cleaned, target):
-                    res.add(target, f"seen on {url}")
-        else:
-            res.errors.append(f"GET {url} -> HTTP {status}, {len(text or '')} bytes")
-
-    for target in cfg.targets:
-        if target in skip_api_for:
-            continue
-        status, detail = probe_ajax(http, target)
-        if status == "found":
-            res.api_alive = True
-            res.confirmed.add(target)
-            res.add(target, detail)
-        elif status == "negative":
-            res.api_alive = True
-        else:
-            res.errors.append(f"api probe {target.isoformat()}: {detail}")
-
+    res = CheckResult(all_dates=dates, sightings=sightings)
+    for d, evidence in hits.items():
+        for ev in evidence:
+            res.add(d, ev)
+    res.horizon = horizon_of(dates, today)
+    if res.horizon:
+        best = max((s for s in sightings if res.horizon in s.dates),
+                   key=lambda s: len(s.dates), default=None)
+        res.horizon_source = best.strategy if best else "?"
     return res
 
 
 # --------------------------------------------------------------------------
-# Notification channels — each returns True on success
+# Notification channels
 # --------------------------------------------------------------------------
 
-PRIORITY = {  # level -> (ntfy, pushover)
-    "alert": ("urgent", 1),
-    "warn": ("high", 0),
-    "info": ("default", -1),
-}
+PRIORITY = {"alert": ("urgent", 1), "warn": ("high", 0), "info": ("default", -1)}
 
 
 def send_ntfy(cfg, title, body, level):
@@ -395,9 +221,7 @@ def send_ntfy(cfg, title, body, level):
 def send_telegram(cfg, title, body, level):
     r = requests.post(
         f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage",
-        json={"chat_id": cfg.telegram_chat_id, "text": f"{title}\n\n{body}"},
-        timeout=15,
-    )
+        json={"chat_id": cfg.telegram_chat_id, "text": f"{title}\n\n{body}"}, timeout=15)
     return r.status_code == 200 and r.json().get("ok") is True
 
 
@@ -408,32 +232,27 @@ def send_discord(cfg, title, body, level):
 
 
 def send_slack(cfg, title, body, level):
-    r = requests.post(cfg.slack_webhook,
-                      json={"text": f"*{title}*\n{body}"}, timeout=15)
+    r = requests.post(cfg.slack_webhook, json={"text": f"*{title}*\n{body}"}, timeout=15)
     return r.status_code == 200
 
 
 def send_pushover(cfg, title, body, level):
     r = requests.post("https://api.pushover.net/1/messages.json", data={
         "token": cfg.pushover_token, "user": cfg.pushover_user,
-        "title": title, "message": body, "priority": PRIORITY[level][1],
-    }, timeout=15)
+        "title": title, "message": body, "priority": PRIORITY[level][1]}, timeout=15)
     return r.status_code == 200 and r.json().get("status") == 1
 
 
 def send_webhook(cfg, title, body, level):
     r = requests.post(cfg.webhook_url, json={
         "source": "comedy-cellar-checker", "level": level,
-        "title": title, "message": body, "ts": time.time(),
-    }, timeout=15)
+        "title": title, "message": body, "ts": time.time()}, timeout=15)
     return 200 <= r.status_code < 300
 
 
 def send_email(cfg, title, body, level):
     msg = EmailMessage()
-    msg["Subject"] = title
-    msg["From"] = cfg.smtp_from
-    msg["To"] = cfg.smtp_to
+    msg["Subject"], msg["From"], msg["To"] = title, cfg.smtp_from, cfg.smtp_to
     msg.set_content(body)
     if cfg.smtp_port == 465:
         server = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=30)
@@ -467,9 +286,8 @@ def enabled_channels(cfg):
 
 
 def send_all(cfg, title, body, level="alert", attempts=2):
-    """Fan out to every channel. True if at least one delivery succeeded."""
     if cfg.dry_run:
-        log.info("[dry-run] %s: %s | %s", level, title, body.replace("\n", " ⏎ "))
+        log.info("[dry-run] %s: %s | %s", level, title, body.replace("\n", " / "))
         return True
     results = {}
     for name, fn in enabled_channels(cfg):
@@ -485,7 +303,8 @@ def send_all(cfg, title, body, level="alert", attempts=2):
             time.sleep(min(2 * attempt, 5))
         results[name] = ok
     log.info("notify [%s] %r -> %s", level, title,
-             ", ".join(f"{k}={'ok' if v else 'FAIL'}" for k, v in results.items()) or "NO CHANNELS")
+             ", ".join(f"{k}={'ok' if v else 'FAIL'}" for k, v in results.items())
+             or "NO CHANNELS")
     return any(results.values())
 
 
@@ -495,14 +314,22 @@ def send_all(cfg, title, body, level="alert", attempts=2):
 
 def default_state():
     return {
-        "found": {},          # iso date -> {first_seen, alerts_sent, last_alert_ts, confirmed}
-        "pending": [],        # queued notifications awaiting successful delivery
-        "fail_since": None,   # ts when the current site-unreachable streak began
+        "found": {},
+        "pending": [],
+        "fail_since": None,
         "fail_alerted_ts": None,
         "last_ok_check": None,
-        "last_heartbeat": None,   # local iso date of last heartbeat
+        "last_heartbeat": None,
         "checks_total": 0,
         "last_loop_ts": None,
+        "horizon": None,
+        "horizon_source": "",
+        "horizon_first_seen_ts": None,
+        "horizon_changed_ts": None,
+        "horizon_unknown_since": None,
+        "horizon_unknown_alerted_ts": None,
+        "horizon_stall_alerted_ts": None,
+        "xhr_urls": [],
     }
 
 
@@ -532,15 +359,12 @@ def save_state(path, state):
 
 
 def enqueue(state, title, body, level):
-    state["pending"].append({
-        "title": title, "body": body, "level": level,
-        "created": time.time(), "attempts": 0, "next_try": 0,
-    })
+    state["pending"].append({"title": title, "body": body, "level": level,
+                             "created": time.time(), "attempts": 0, "next_try": 0})
 
 
 def flush_pending(cfg, state):
-    now = time.time()
-    remaining = []
+    now, remaining = time.time(), []
     for item in state["pending"]:
         if now < item.get("next_try", 0):
             remaining.append(item)
@@ -550,61 +374,59 @@ def flush_pending(cfg, state):
         item["attempts"] += 1
         backoff = min(60 * (2 ** min(item["attempts"], 5)), 1800)
         item["next_try"] = now + backoff
-        log.warning("delivery failed (attempt %d), retrying in %ds: %r",
+        log.warning("delivery failed (attempt %d), retry in %ds: %r",
                     item["attempts"], backoff, item["title"])
         remaining.append(item)
     state["pending"] = remaining
 
 
 # --------------------------------------------------------------------------
-# Alert / heartbeat / watchdog logic
+# Alerting
 # --------------------------------------------------------------------------
 
 def fmt_date(d: date) -> str:
-    return d.strftime("%A, %B %-d, %Y") if os.name != "nt" else d.strftime("%A, %B %d, %Y")
+    try:
+        return d.strftime("%A, %B %-d, %Y")
+    except ValueError:
+        return d.strftime("%A, %B %d, %Y")
+
+
+def short(d: date) -> str:
+    try:
+        return d.strftime("%b %-d")
+    except ValueError:
+        return d.strftime("%b %d")
 
 
 def alert_body(dates_with_evidence, cfg, reminder=None):
     lines = ["Comedy Cellar just posted shows for:"]
     for d, evidence in sorted(dates_with_evidence.items()):
         lines.append(f"  - {fmt_date(d)}   ({'; '.join(evidence)})")
-    lines += [
-        "",
-        f"Book NOW: {RESERVATIONS_URL}",
-        f"Lineup:   {LINEUP_URL}",
-    ]
+    lines += ["", f"Book NOW: {RESERVATIONS_URL}", f"Lineup:   {LINEUP_URL}"]
     if reminder:
         lines.append(f"\n(Reminder {reminder} — set ALERT_REPEATS=0 to silence repeats.)")
     elif cfg.alert_repeats > 0:
-        lines.append(f"\n(You'll get {cfg.alert_repeats} reminders, "
-                     f"every {cfg.alert_repeat_minutes} min, in case this one is missed.)")
+        lines.append(f"\n(You'll get {cfg.alert_repeats} reminders, every "
+                     f"{cfg.alert_repeat_minutes} min, in case this one is missed.)")
     return "\n".join(lines)
 
 
 def handle_check_result(cfg, state, res: CheckResult):
     now = time.time()
 
-    # --- new dates found -> one combined alert
     new = {}
     for d, evidence in res.found.items():
         key = d.isoformat()
         if key not in state["found"]:
             new[d] = evidence
-            state["found"][key] = {
-                "first_seen": now, "alerts_sent": 1, "last_alert_ts": now,
-                "confirmed": d in res.confirmed,
-            }
-        else:
-            state["found"][key]["confirmed"] = (
-                state["found"][key].get("confirmed") or d in res.confirmed)
+            state["found"][key] = {"first_seen": now, "alerts_sent": 1,
+                                   "last_alert_ts": now}
     if new:
-        names = ", ".join(d.strftime("%b %-d" if os.name != "nt" else "%b %d")
-                          for d in sorted(new))
+        names = ", ".join(short(d) for d in sorted(new))
         log.info("TARGET DATES FOUND: %s", names)
         enqueue(state, f"Comedy Cellar: {names} tickets are UP!",
                 alert_body(new, cfg), "alert")
 
-    # --- reminders for already-found dates
     for key, info in state["found"].items():
         if info["alerts_sent"] <= cfg.alert_repeats and \
                 now - info["last_alert_ts"] >= cfg.alert_repeat_minutes * 60:
@@ -612,31 +434,105 @@ def handle_check_result(cfg, state, res: CheckResult):
             info["alerts_sent"] += 1
             info["last_alert_ts"] = now
             n = info["alerts_sent"] - 1
-            enqueue(state, f"Reminder: Comedy Cellar {d.strftime('%b %d')} tickets are up",
+            enqueue(state, f"Reminder: Comedy Cellar {short(d)} tickets are up",
                     alert_body({d: ["reminder"]}, cfg,
                                reminder=f"{n}/{cfg.alert_repeats}"), "alert")
 
-    # --- watchdog: site uncheckable vs recovered
     if res.ok:
         state["last_ok_check"] = now
         if state.get("fail_alerted_ts"):
             enqueue(state, "Comedy Cellar checker recovered",
-                    "The site is reachable again — monitoring resumed normally.", "info")
-        state["fail_since"] = None
-        state["fail_alerted_ts"] = None
+                    "The site is reachable again — monitoring resumed.", "info")
+        state["fail_since"] = state["fail_alerted_ts"] = None
     else:
         state["fail_since"] = state.get("fail_since") or now
         failing_h = (now - state["fail_since"]) / 3600
-        last_alert = state.get("fail_alerted_ts")
+        last = state.get("fail_alerted_ts")
         if failing_h >= cfg.failure_alert_hours and (
-                not last_alert or now - last_alert >= cfg.failure_realert_hours * 3600):
+                not last or now - last >= cfg.failure_realert_hours * 3600):
             state["fail_alerted_ts"] = now
             enqueue(state, "Comedy Cellar checker is BLIND",
-                    f"Every check has failed for {failing_h:.1f}h "
-                    f"(site down, blocking us, or page changed).\n"
-                    f"Errors: {'; '.join(res.errors[:4]) or 'unknown'}\n\n"
-                    f"Until this recovers, CHECK MANUALLY: {LINEUP_URL}",
-                    "warn")
+                    f"Every strategy has failed for {failing_h:.1f}h.\n"
+                    f"{chr(10).join(res.errors[:5])}\n\n"
+                    f"CHECK MANUALLY: {LINEUP_URL}", "warn")
+
+
+def handle_horizon(cfg, state, res: CheckResult):
+    """The core guarantee: we must always know the site's 'listing through' date.
+
+    Not knowing it is an alarm — that is precisely the state in which target dates
+    could appear and go unnoticed.
+    """
+    now = time.time()
+    if res.xhr_urls_sample:
+        state["xhr_urls"] = res.xhr_urls_sample
+
+    if res.horizon is None:
+        state["horizon_unknown_since"] = state.get("horizon_unknown_since") or now
+        blind_h = (now - state["horizon_unknown_since"]) / 3600
+        last = state.get("horizon_unknown_alerted_ts")
+        if blind_h >= cfg.horizon_unknown_hours and (
+                not last or now - last >= cfg.failure_realert_hours * 3600):
+            state["horizon_unknown_alerted_ts"] = now
+            enqueue(state, "Comedy Cellar watcher CANNOT read any dates",
+                    f"No strategy has produced a single date for {blind_h:.1f}h, so the "
+                    f"'date through' is unknown. Target dates could appear WITHOUT an "
+                    f"alert — treat this as broken.\n\n"
+                    f"Strategy results:\n" +
+                    "\n".join(f"  - {s.detail}" for s in res.sightings[:8]) +
+                    f"\n\nCHECK MANUALLY: {LINEUP_URL}", "warn")
+        return
+
+    prev = state.get("horizon")
+    iso = res.horizon.isoformat()
+    if prev != iso:
+        state["horizon"] = iso
+        state["horizon_source"] = res.horizon_source
+        state["horizon_changed_ts"] = now
+        state["horizon_first_seen_ts"] = state.get("horizon_first_seen_ts") or now
+        state["horizon_stall_alerted_ts"] = None
+    if state.get("horizon_unknown_since") or state.get("horizon_unknown_alerted_ts"):
+        if state.get("horizon_unknown_alerted_ts"):
+            enqueue(state, "Comedy Cellar watcher can read dates again",
+                    f"Recovered — the site now lists shows through "
+                    f"{fmt_date(res.horizon)} (via {res.horizon_source}).", "info")
+        state["horizon_unknown_since"] = state["horizon_unknown_alerted_ts"] = None
+
+    # A frozen horizon means the scraper reads *something* but isn't tracking the
+    # site any more (cached page, stale endpoint) — also a silent failure.
+    changed = state.get("horizon_changed_ts") or now
+    stalled_days = (now - changed) / 86400
+    last = state.get("horizon_stall_alerted_ts")
+    if stalled_days >= cfg.horizon_stall_days and (
+            not last or now - last >= cfg.failure_realert_hours * 3600):
+        state["horizon_stall_alerted_ts"] = now
+        enqueue(state, "Comedy Cellar watcher: date-through is STUCK",
+                f"The furthest listed date has been {fmt_date(res.horizon)} for "
+                f"{stalled_days:.1f} days without advancing. The Cellar normally "
+                f"rolls its window forward daily, so this likely means we're reading "
+                f"a stale source.\n\nCHECK MANUALLY: {LINEUP_URL}", "warn")
+
+
+def status_lines(cfg, state, res: CheckResult):
+    lines = []
+    if res.horizon:
+        lines.append(f"Site lists shows through: {fmt_date(res.horizon)} "
+                     f"(via {res.horizon_source})")
+    else:
+        lines.append("Site lists shows through: UNKNOWN — no dates parsed (BROKEN)")
+    ok = [s.strategy for s in res.sightings if s.ok]
+    with_dates = res.working
+    lines.append(f"Strategies reachable: {', '.join(sorted(set(ok))) or 'none'}; "
+                 f"producing dates: {', '.join(sorted(set(with_dates))) or 'NONE'}")
+    found = [fmt_date(t) for t in cfg.targets if t.isoformat() in state["found"]]
+    missing = [fmt_date(t) for t in cfg.targets if t.isoformat() not in state["found"]]
+    if found:
+        lines.append("Already found: " + "; ".join(found))
+    if missing:
+        lines.append("Still waiting for: " + "; ".join(missing))
+    else:
+        lines.append("All target dates found — you can stop this service.")
+    return lines
 
 
 def maybe_heartbeat(cfg, state, res: CheckResult):
@@ -645,31 +541,14 @@ def maybe_heartbeat(cfg, state, res: CheckResult):
     now_local = datetime.now(ZoneInfo(cfg.tz))
     today = now_local.date().isoformat()
     if state.get("last_heartbeat") is None:
-        state["last_heartbeat"] = today  # skip on first ever run; startup notice covers it
+        state["last_heartbeat"] = today
         return
     if state["last_heartbeat"] == today or now_local.hour < cfg.heartbeat_hour:
         return
     state["last_heartbeat"] = today
-
-    future = sorted(d for d in res.all_dates if d >= now_local.date())
-    horizon = fmt_date(future[-1]) if future else "unknown (no dates parsed!)"
-    missing = [fmt_date(t) for t in cfg.targets
-               if t.isoformat() not in state["found"]]
-    found = [fmt_date(t) for t in cfg.targets if t.isoformat() in state["found"]]
-    lines = [
-        f"Still watching. {state['checks_total']} checks so far.",
-        f"Site currently lists shows through: {horizon}",
-        f"Strategies: page scan {'OK' if res.pages_ok else 'FAILING'} "
-        f"({res.pages_ok}/{len(cfg.watch_urls)} pages), "
-        f"lineup API {'OK' if res.api_alive else 'FAILING'}",
-    ]
-    if found:
-        lines.append("Already found: " + "; ".join(found))
-    if missing:
-        lines.append("Still waiting for: " + "; ".join(missing))
-    else:
-        lines.append("All target dates found — you can stop this service.")
-    enqueue(state, "Comedy Cellar watcher: daily heartbeat", "\n".join(lines), "info")
+    body = [f"Still watching. {state['checks_total']} checks so far."] + \
+        status_lines(cfg, state, res)
+    enqueue(state, "Comedy Cellar watcher: daily heartbeat", "\n".join(body), "info")
 
 
 # --------------------------------------------------------------------------
@@ -686,10 +565,9 @@ def _handle_signal(signum, frame):
 
 
 def describe(cfg):
-    chans = ", ".join(name for name, _ in enabled_channels(cfg)) or "NONE — configure a channel!"
-    targets = ", ".join(t.isoformat() for t in cfg.targets)
-    return (f"Watching for: {targets}\nEvery {cfg.check_interval}s | "
-            f"channels: {chans}\nState: {cfg.state_file}")
+    chans = ", ".join(n for n, _ in enabled_channels(cfg)) or "NONE — configure a channel!"
+    return (f"Watching for: {', '.join(t.isoformat() for t in cfg.targets)}\n"
+            f"Every {cfg.check_interval}s | channels: {chans}")
 
 
 def run(cfg: Config, once=False):
@@ -697,28 +575,30 @@ def run(cfg: Config, once=False):
     state = load_state(cfg.state_file)
     log.info("starting\n%s", describe(cfg))
 
-    if cfg.startup_notify and not once:
-        enqueue(state, "Comedy Cellar watcher started", describe(cfg), "info")
-
-    last_check = 0.0
+    last_check, announced = 0.0, not (cfg.startup_notify and not once)
     while True:
         loop_start = time.time()
         try:
             if loop_start - last_check >= cfg.check_interval or once:
                 last_check = loop_start + random.uniform(-0.1, 0.1) * cfg.check_interval
-                already = {date.fromisoformat(k) for k, v in state["found"].items()
-                           if v.get("confirmed")}
-                res = perform_check(cfg, http, skip_api_for=already)
+                res = perform_check(cfg, http)
                 state["checks_total"] += 1
-                log.info("check #%d: pages_ok=%d api_alive=%s found=%s horizon=%s%s",
-                         state["checks_total"], res.pages_ok, res.api_alive,
+                log.info("check #%d: horizon=%s via %s | found=%s | %s",
+                         state["checks_total"],
+                         res.horizon.isoformat() if res.horizon else "UNKNOWN",
+                         res.horizon_source or "-",
                          [d.isoformat() for d in res.found] or "none",
-                         max(res.all_dates).isoformat() if res.all_dates else "?",
-                         (" errors=" + "; ".join(res.errors)) if res.errors else "")
+                         "; ".join(s.detail for s in res.sightings))
                 handle_check_result(cfg, state, res)
+                handle_horizon(cfg, state, res)
                 maybe_heartbeat(cfg, state, res)
+                if not announced:
+                    announced = True
+                    enqueue(state, "Comedy Cellar watcher started",
+                            describe(cfg) + "\n\n" +
+                            "\n".join(status_lines(cfg, state, res)), "info")
                 if not res.ok:
-                    http.reset()  # fresh session/cookies for the next attempt
+                    http.reset()
             flush_pending(cfg, state)
         except Exception:
             log.exception("tick failed (loop continues)")
@@ -737,7 +617,6 @@ def run(cfg: Config, once=False):
 # --------------------------------------------------------------------------
 
 def health(cfg) -> int:
-    """0 = healthy (loop wrote state recently), 1 = wedged."""
     try:
         age = time.time() - os.path.getmtime(cfg.state_file)
     except OSError:
@@ -749,28 +628,55 @@ def test_notify(cfg) -> int:
     ok = send_all(cfg, "Comedy Cellar watcher: test notification",
                   "If you can read this, alerts will reach you.\n" + describe(cfg),
                   "info", attempts=3)
-    print("test notification:", "DELIVERED (at least one channel)" if ok else "ALL CHANNELS FAILED")
+    print("test notification:", "DELIVERED" if ok else "ALL CHANNELS FAILED")
     return 0 if ok else 1
+
+
+def diagnose(cfg) -> int:
+    """Full transparency dump: what every strategy saw. Run this on the VPS."""
+    http = HttpClient()
+    today = datetime.now(ZoneInfo(cfg.tz)).date()
+    res = perform_check(cfg, http, force_browser=True)
+    print("=" * 72)
+    print(f"DIAGNOSIS  {datetime.now(ZoneInfo(cfg.tz)):%Y-%m-%d %H:%M %Z}  (today={today})")
+    print("=" * 72)
+    for s in res.sightings:
+        mark = "ok " if s.ok else "FAIL"
+        print(f"[{mark}] {s.strategy:8s} {s.detail}")
+        if s.dates:
+            ds = sorted(s.dates)
+            print(f"         dates: {', '.join(d.isoformat() for d in ds[:12])}"
+                  f"{' …' if len(ds) > 12 else ''}  (max {max(ds)})")
+        for u in s.xhr_urls[:15]:
+            print(f"         xhr: {u}")
+    print("-" * 72)
+    print("DATE THROUGH:",
+          f"{res.horizon} (via {res.horizon_source})" if res.horizon
+          else "UNKNOWN — no strategy produced a date")
+    print("TARGET HITS:", {d.isoformat(): v for d, v in res.found.items()} or "none")
+    print("=" * 72)
+    return 0 if res.horizon else 1
 
 
 def main():
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--once", action="store_true", help="single check, then exit")
-    parser.add_argument("--test-notify", action="store_true",
-                        help="send a test message through every configured channel")
-    parser.add_argument("--health", action="store_true", help="container healthcheck")
-    args = parser.parse_args()
+        format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--once", action="store_true", help="single check, then exit")
+    p.add_argument("--test-notify", action="store_true", help="test every channel")
+    p.add_argument("--diagnose", action="store_true",
+                   help="dump what every detection strategy sees")
+    p.add_argument("--health", action="store_true", help="container healthcheck")
+    args = p.parse_args()
 
     cfg = load_config()
     if args.health:
         sys.exit(health(cfg))
     if args.test_notify:
         sys.exit(test_notify(cfg))
+    if args.diagnose:
+        sys.exit(diagnose(cfg))
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -780,10 +686,10 @@ def main():
         raise
     except Exception:
         log.exception("fatal error")
-        try:  # best effort: tell the user the process is bouncing
+        try:
             send_all(cfg, "Comedy Cellar checker crashed",
-                     "The watcher hit a fatal error and will be restarted by Docker. "
-                     "Check container logs if this repeats.", "warn", attempts=1)
+                     "Fatal error; Docker will restart it. Check logs if this repeats.",
+                     "warn", attempts=1)
         finally:
             sys.exit(1)
 
