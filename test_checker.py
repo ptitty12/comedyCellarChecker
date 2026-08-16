@@ -18,8 +18,9 @@ from unittest import mock
 import checker
 import sources
 from checker import (CheckResult, Config, alert_body, enqueue, flush_pending,
-                     handle_check_result, handle_horizon, health, load_state,
-                     perform_check, save_state, send_all, status_lines)
+                     handle_check_result, handle_day_status, handle_horizon,
+                     health, load_state, perform_check, save_state, send_all,
+                     status_lines)
 from dateparse import (clean_html, extract_all_dates, horizon_of,
                        text_mentions_date)
 from sources import (Sighting, from_browser, from_lineup_api, from_rest,
@@ -79,20 +80,13 @@ class TestDateMatching(unittest.TestCase):
         self.assertIsNone(horizon_of(set(), TODAY))
 
 
-EMPTY_API = json.dumps({"show": {"html": ""}})
-
-
-def shows_api(html='<div class="set-header"><h2>7:00 pm show</h2></div>'):
-    """Shaped like the real response captured from the live site."""
-    return json.dumps({"show": {"html": html}})
-
 
 class FakeHttp:
     def __init__(self, pages=None, api=None, json_urls=None, api_default=None):
         self.pages, self.api, self.json_urls = pages or {}, api or {}, json_urls or {}
-        # Unlisted dates answer like the real endpoint does for a date with no
-        # lineup yet — including the sentinel the trust guard queries.
-        self.api_default = api_default or (200, EMPTY_API)
+        # Unlisted dates answer the way the live endpoint does for a date whose
+        # lineup is not posted yet, date echo included.
+        self.api_default = api_default or (200, None)
         self.calls, self.last = 0, None
 
     def get(self, url):
@@ -105,7 +99,13 @@ class FakeHttp:
         """Keyed by the requested date, mimicking the real lineup endpoint."""
         self.calls += 1
         self.last = (url, data)
-        return self.api.get(json.loads(data["json"])["date"], self.api_default)
+        key = json.loads(data["json"])["date"]
+        if key in self.api:
+            return self.api[key]
+        status, body = self.api_default
+        if body is None:
+            body = json.dumps({"show": {"html": "", "date": key}, "date": key})
+        return status, body
 
     def reset(self):
         pass
@@ -117,129 +117,115 @@ PAGE_WITH_SEP10 = "<html>" + "x" * 3000 + \
 PAGE_NO_DATES = "<html>" + "x" * 4000 + "<div id='app'>loading…</div></html>"
 
 
-class TestStrategies(unittest.TestCase):
-    def test_static_finds_target_and_dates(self):
-        s = from_static(FakeHttp(pages={"u": (200, PAGE_WITH_SEP10)}),
-                        ["u"], TARGETS, TODAY)[0]
-        self.assertTrue(s.ok)
-        self.assertIn(SEP10, s.target_hits)
-        self.assertIn(date(2026, 8, 24), s.dates)
 
-    def test_static_reports_404(self):
-        s = from_static(FakeHttp(), ["u"], TARGETS, TODAY)[0]
-        self.assertFalse(s.ok)
-        self.assertIn("404", s.detail)
+# Real fragments captured from the live API on 2026-08-16.
+LINEUP_HTML = (
+    '<div><div class="set-header"><span class="lineup-toggle" data-lineup-id="44040">+'
+    '</span><div class="info"><h2><span class="bold">7:00 pm<span class="hide-mobile">'
+    ' show</span></span><span class="divider">-</span><span class="title">Colin Quinn '
+    'Returns to The CQ Room</span></h2></div></div><div class="lineup" '
+    'data-set-content="44040"><div class="set-content"><div><img src="/x.jpg" '
+    'alt="Nick Griffin&#039;s headshot"></div><div><p><span class="name">Nick Griffin'
+    '</span> COMEDY CENTRAL</p></div></div><div class="set-content"><div><p>'
+    '<span class="name">Colin Quinn</span> SNL</p></div></div>'
+    '<a href="https://www.comedycellar.com/reservations-newyork/?showid=1787007600">'
+    'Make A Reservation</a></div></div>'
+)
+NO_LINEUP_HTML = '<p class="no-shows">No Comedians added yet!</p>'
 
-    def test_static_js_page_yields_nothing(self):
-        """The real failure we hit: page loads fine, contains zero dates."""
-        s = from_static(FakeHttp(pages={"u": (200, PAGE_NO_DATES)}),
-                        ["u"], TARGETS, TODAY)[0]
-        self.assertTrue(s.ok)
-        self.assertEqual(s.dates, set())
 
-    def test_rest_parses_events_json(self):
-        url = sources.REST_ENDPOINTS[0].format(start=TODAY.isoformat())
-        body = json.dumps({"events": [{"start_date": "2026-09-11 19:00:00",
-                                       "title": "Late Show"}]})
-        out = from_rest(FakeHttp(json_urls={url: (200, body)}), TARGETS, TODAY)
-        hit = [s for s in out if s.ok]
-        self.assertTrue(hit)
-        self.assertIn(SEP11, hit[0].target_hits)
+def api_doc(day, html):
+    """Exactly the envelope the live endpoint returns, date echo included."""
+    return json.dumps({"show": {"html": html, "date": day.strftime("%A %B %d, %Y")},
+                       "date": day.isoformat()})
 
-    def test_rest_ignores_html_error_page(self):
-        url = sources.REST_ENDPOINTS[0].format(start=TODAY.isoformat())
-        out = from_rest(FakeHttp(json_urls={url: (200, "<html>nope</html>")}),
-                        TARGETS, TODAY)
-        self.assertFalse(any(s.ok for s in out))
+
+class TestClassifyLineup(unittest.TestCase):
+    def test_lineup_html_yields_comedians_showtimes_and_booking_ids(self):
+        info = sources.classify_lineup(LINEUP_HTML)
+        self.assertEqual(info["status"], sources.LINEUP)
+        self.assertEqual(info["comedians"], ["Nick Griffin", "Colin Quinn"])
+        self.assertEqual(info["showtimes"], ["7:00 pm"])
+        self.assertEqual(info["titles"], ["Colin Quinn Returns to The CQ Room"])
+        self.assertEqual(info["show_ids"], ["1787007600"])
+
+    def test_no_comedians_yet_is_its_own_state(self):
+        info = sources.classify_lineup(NO_LINEUP_HTML)
+        self.assertEqual(info["status"], sources.NO_LINEUP)
+        self.assertEqual(info["comedians"], [])
+
+    def test_empty_means_not_listed(self):
+        self.assertEqual(sources.classify_lineup("")["status"], sources.NOT_LISTED)
+
+    def test_showtimes_without_names(self):
+        html = '<div class="set-header"><h2><span class="bold">9:30 pm show</span></h2></div>'
+        self.assertEqual(sources.classify_lineup(html)["status"], sources.SHOWTIMES)
+
+    def test_unrecognised_html_never_alerts(self):
+        info = sources.classify_lineup("<div>site redesign</div>")
+        self.assertEqual(info["status"], sources.UNKNOWN)
+        self.assertLess(sources.RANK[info["status"]], sources.ALERT_RANK)
+
+    def test_ranks_are_ordered(self):
+        r = sources.RANK
+        self.assertLess(r[sources.NOT_LISTED], r[sources.NO_LINEUP])
+        self.assertLess(r[sources.NO_LINEUP], r[sources.SHOWTIMES])
+        self.assertLess(r[sources.SHOWTIMES], r[sources.LINEUP])
+
 
 class TestLineupApi(unittest.TestCase):
-    """The endpoint never echoes the date, so both controls are load-bearing."""
-
-    def setUp(self):
-        sources._CALIBRATION.clear()
-
-    def _http(self, **kw):
-        """An endpoint that honours ISO dates for anything within `window` days."""
-        window = kw.pop("window", 30)
-        api = {}
-        for off in range(-1, window + 1):
-            api[(TODAY + timedelta(days=off)).isoformat()] = (200, shows_api())
-        api.update(kw.pop("api", {}))
-        return FakeHttp(api=api, **kw)
-
-    def test_calibration_accepts_a_working_encoding(self):
-        encoder, detail = sources.calibrate_lineup_api(self._http(), TODAY)
-        self.assertIsNotNone(encoder)
-        self.assertEqual(encoder(SEP10), "2026-09-10")
-        self.assertIn("verified", detail)
-
-    def test_shows_for_a_target_is_a_hit(self):
-        # Window wide enough to include the targets (31 days out).
-        s = from_lineup_api(self._http(window=40), TARGETS, TODAY)[0]
+    def test_status_per_target_date(self):
+        http = FakeHttp(api={SEP10.isoformat(): (200, api_doc(SEP10, LINEUP_HTML)),
+                             SEP11.isoformat(): (200, api_doc(SEP11, NO_LINEUP_HTML))})
+        s = from_lineup_api(http, [SEP10, SEP11], TODAY)[0]
         self.assertTrue(s.ok)
-        self.assertEqual(set(s.target_hits), set(TARGETS))
+        self.assertEqual(s.day_status[SEP10]["status"], sources.LINEUP)
+        self.assertEqual(s.day_status[SEP11]["status"], sources.NO_LINEUP)
+        self.assertIn(SEP10, s.target_hits)      # actionable
+        self.assertNotIn(SEP11, s.target_hits)   # nothing to do yet
 
-    def test_targets_outside_the_window_are_not_hits(self):
-        s = from_lineup_api(self._http(window=20), TARGETS, TODAY)[0]
-        self.assertTrue(s.ok)
+    def test_answer_about_the_wrong_date_is_discarded(self):
+        """A stale or ignored date parameter must never page the user."""
+        wrong = json.dumps({"show": {"html": LINEUP_HTML,
+                                     "date": "Sunday August 16, 2026"},
+                            "date": TODAY.isoformat()})
+        s = from_lineup_api(FakeHttp(api={SEP10.isoformat(): (200, wrong)}),
+                            [SEP10], TODAY)[0]
+        self.assertEqual(s.day_status, {})
         self.assertEqual(s.target_hits, {})
+        self.assertIn("not 2026-09-10", s.detail)
 
-    def test_endpoint_that_never_says_yes_declares_itself_useless(self):
-        """The live failure: ISO dates always answer 'no shows'.
-
-        The negative control alone passes here, so without a positive control
-        this would look healthy while being incapable of ever detecting a date.
-        """
-        s = from_lineup_api(FakeHttp(api_default=(200, EMPTY_API)), TARGETS, TODAY)[0]
-        self.assertTrue(s.ok)
+    def test_response_without_a_date_echo_is_not_trusted(self):
+        http = FakeHttp(api={SEP10.isoformat():
+                             (200, json.dumps({"show": {"html": LINEUP_HTML}}))})
+        s = from_lineup_api(http, [SEP10], TODAY)[0]
         self.assertEqual(s.target_hits, {})
-        self.assertIn("contributes nothing", s.detail)
-        self.assertIn("no date encoding works", s.detail)
+        self.assertIn("did not say which date", s.detail)
 
-    def test_endpoint_that_ignores_the_date_is_rejected(self):
-        """Says yes to everything, including a date 300 days out."""
-        s = from_lineup_api(FakeHttp(api_default=(200, shows_api())), TARGETS, TODAY)[0]
-        self.assertTrue(s.ok)
-        self.assertEqual(s.target_hits, {})     # would otherwise be 3 false alarms
-        self.assertEqual(s.dates, set())
-        self.assertIn("echoes", s.detail)
-
-    def test_unreachable_endpoint_is_reported(self):
-        s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
-        self.assertFalse(s.ok)
-        self.assertIn("unreachable", s.detail)
-
-    def test_outage_after_good_calibration_reports_unhealthy(self):
-        """A cached calibration must not mask a dead endpoint from the watchdog."""
-        sources.calibrate_lineup_api(self._http(), TODAY)      # calibrate while up
-        s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
-        self.assertFalse(s.ok)                                 # not "fine, no shows"
-        self.assertEqual(sources._CALIBRATION, {})             # will re-verify
-
-    def test_calibration_is_cached_per_day(self):
-        http = self._http()
-        sources.calibrate_lineup_api(http, TODAY)
-        before = http.calls
-        sources.calibrate_lineup_api(http, TODAY)
-        self.assertEqual(http.calls, before)          # no repeat probing
-        sources.calibrate_lineup_api(http, TODAY + timedelta(days=1))
-        self.assertGreater(http.calls, before)        # new day, re-verified
+    def test_prose_date_echo_is_accepted(self):
+        doc = json.dumps({"show": {"html": LINEUP_HTML,
+                                   "date": "Thursday September 10, 2026"}})
+        s = from_lineup_api(FakeHttp(api={SEP10.isoformat(): (200, doc)}),
+                            [SEP10], TODAY)[0]
+        self.assertEqual(s.day_status[SEP10]["status"], sources.LINEUP)
 
     def test_request_matches_the_captured_contract(self):
-        http = self._http()
+        http = FakeHttp()
         from_lineup_api(http, [SEP10], TODAY)
         url, data = http.last
         self.assertEqual(url, sources.LINEUP_API_URL)
         self.assertEqual(data["action"], "cc_get_shows")
         self.assertEqual(json.loads(data["json"]),
-                         {"date": SEP10.isoformat(), "venue": "newyork",
-                          "type": "lineup"})
+                         {"date": "2026-09-10", "venue": "newyork", "type": "lineup"})
 
-    def test_query_accepts_today_keyword(self):
-        http = FakeHttp(api={"today": (200, shows_api())})
-        reachable, fragment, _ = sources.query_lineup_api(http, "today")
-        self.assertTrue(reachable)
-        self.assertTrue(sources.has_shows(fragment))
+    def test_unreachable_endpoint_is_unhealthy(self):
+        s = from_lineup_api(FakeHttp(api_default=(0, "")), TARGETS, TODAY)[0]
+        self.assertFalse(s.ok)
+
+    def test_api_is_not_authoritative_for_the_date_through(self):
+        """It is only asked about targets, so it must not define the horizon."""
+        self.assertFalse(from_lineup_api(FakeHttp(), TARGETS, TODAY)[0].authoritative)
+
 
 
 JS_PAGE = """<!doctype html><html><body><div id="app">loading...</div>
@@ -347,9 +333,6 @@ class TestBrowserStrategy(unittest.TestCase):
 
 
 class TestDiscoveryOrchestration(unittest.TestCase):
-    def setUp(self):
-        sources._CALIBRATION.clear()   # process-global by design; isolate tests
-
     def test_browser_skipped_when_lineup_html_has_dates(self):
         cfg = make_cfg(watch_urls=[sources.LINEUP_URL])
         http = FakeHttp(pages={sources.LINEUP_URL: (200, PAGE_WITH_SEP10)})
@@ -455,6 +438,124 @@ class TestHorizonGuarantee(unittest.TestCase):
         self.assertIn("UNKNOWN", "\n".join(status_lines(cfg, state, result(None))))
         good = "\n".join(status_lines(cfg, state, result(date(2026, 8, 18))))
         self.assertIn("August 18, 2026", good)
+
+
+def status_result(by_date=None):
+    """CheckResult carrying per-date statuses, as the API strategy produces them."""
+    res = CheckResult(sightings=[Sighting("lineup-api", ok=True, detail="stub",
+                                          authoritative=False)])
+    for d, status in (by_date or {}).items():
+        info = sources.classify_lineup(
+            LINEUP_HTML if status == sources.LINEUP else
+            '<div class="set-header"><span class="bold">9:30 pm show</span></div>'
+            if status == sources.SHOWTIMES else
+            NO_LINEUP_HTML if status == sources.NO_LINEUP else "")
+        res.day_status[d] = info
+    return res
+
+
+class TestDayStatusAlerts(unittest.TestCase):
+    """What the user actually asked for: tell me when comedians are announced."""
+
+    def test_no_lineup_baseline_is_silent(self):
+        """Deploying while the dates say 'no comedians yet' must not spam."""
+        cfg, state = make_cfg(), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.NO_LINEUP}))
+        self.assertEqual(state["pending"], [])
+        self.assertEqual(state["day_status"]["2026-09-10"]["status"], sources.NO_LINEUP)
+
+    def test_lineup_announced_alerts_with_names(self):
+        cfg, state = make_cfg(), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.NO_LINEUP}))
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)
+        alert = state["pending"][0]
+        self.assertEqual(alert["level"], "alert")
+        self.assertIn("LINEUP UP", alert["title"])
+        self.assertIn("Nick Griffin", alert["title"])
+        self.assertIn("Colin Quinn", alert["body"])
+        self.assertIn("showid=1787007600", alert["body"])   # bookable link
+
+    def test_showtimes_before_comedians_also_alerts(self):
+        cfg, state = make_cfg(), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP11: sources.NO_LINEUP}))
+        handle_day_status(cfg, state, status_result({SEP11: sources.SHOWTIMES}))
+        self.assertEqual(len(state["pending"]), 1)
+        self.assertIn("showtimes posted", state["pending"][0]["title"])
+        # ...and upgrading to a full lineup afterwards alerts again.
+        handle_day_status(cfg, state, status_result({SEP11: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 2)
+        self.assertIn("LINEUP UP", state["pending"][1]["title"])
+
+    def test_steady_state_does_not_repeat(self):
+        cfg, state = make_cfg(alert_repeats=0), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.NO_LINEUP}))
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        for _ in range(5):
+            handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)
+
+    def test_lineup_already_up_on_first_sight_still_alerts(self):
+        """A lineup posted while the watcher was down must not be missed."""
+        cfg, state = make_cfg(), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP12: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)
+        self.assertIn("already posted", state["pending"][0]["title"])
+
+    def test_going_backwards_neither_alerts_nor_rearms(self):
+        """A blip must not fire, and recovering from it must not re-fire."""
+        cfg, state = make_cfg(alert_repeats=0), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.NO_LINEUP}))
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)
+        handle_day_status(cfg, state, status_result({SEP10: sources.NO_LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)                     # no alert
+        self.assertEqual(state["day_status"]["2026-09-10"]["status"], sources.LINEUP)
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        self.assertEqual(len(state["pending"]), 1)                     # no re-fire
+
+    def test_unknown_status_never_alerts(self):
+        cfg, state = make_cfg(), checker.default_state()
+        res = CheckResult(sightings=[Sighting("lineup-api", ok=True)])
+        res.day_status[SEP10] = sources.classify_lineup("<div>redesign</div>")
+        handle_day_status(cfg, state, res)
+        self.assertEqual(state["pending"], [])
+
+    def test_reminders_repeat_then_stop(self):
+        cfg, state = make_cfg(alert_repeats=2), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        rec = state["day_status"]["2026-09-10"]
+        for expected in (2, 3):
+            rec["last_alert_ts"] -= 31 * 60
+            handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+            self.assertEqual(rec["alerts_sent"], expected)
+        rec["last_alert_ts"] -= 31 * 60
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP}))
+        self.assertEqual(rec["alerts_sent"], 3)
+        self.assertEqual(len(state["pending"]), 3)
+
+    def test_heartbeat_reports_each_target_status(self):
+        cfg, state = make_cfg(), checker.default_state()
+        handle_day_status(cfg, state, status_result({SEP10: sources.LINEUP,
+                                                       SEP11: sources.NO_LINEUP}))
+        text = "\n".join(status_lines(cfg, state, status_result()))
+        self.assertIn("Sep 10", text)
+        self.assertIn("LINEUP ANNOUNCED", text)
+        self.assertIn("Nick Griffin", text)
+        self.assertIn("no comedians yet", text)
+
+    def test_old_state_file_without_day_status_upgrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w") as fh:
+                json.dump({"found": {"2026-09-10": {"first_seen": 1, "alerts_sent": 1,
+                                                    "last_alert_ts": 1}},
+                           "pending": [], "checks_total": 42}, fh)
+            state = load_state(path)
+            self.assertEqual(state["day_status"], {})
+            handle_day_status(make_cfg(), state,
+                              status_result({SEP10: sources.NO_LINEUP}))
+            self.assertEqual(state["pending"], [])   # no duplicate of the old alert
 
 
 class TestAlertFlow(unittest.TestCase):

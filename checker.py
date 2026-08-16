@@ -32,7 +32,9 @@ import requests
 import sources
 from dateparse import (clean_html, extract_all_dates, horizon_of,  # noqa: F401
                        patterns_for_date, text_mentions_date)
-from sources import LINEUP_URL, RESERVATIONS_URL, HttpClient, discover
+from sources import (ALERT_RANK, LINEUP, LINEUP_URL, NO_LINEUP, NOT_LISTED,
+                     RANK, RESERVATIONS_URL, SHOWTIMES, UNKNOWN, HttpClient,
+                     day_status_of, discover)
 
 log = logging.getLogger("cellar")
 
@@ -143,6 +145,7 @@ class CheckResult:
     horizon: object = None
     horizon_source: str = ""
     sightings: list = field(default_factory=list)
+    day_status: dict = field(default_factory=dict)
 
     @property
     def ok(self):
@@ -186,7 +189,8 @@ def perform_check(cfg: Config, http, force_browser=False) -> CheckResult:
             for d, ev in s.target_hits.items():
                 hits.setdefault(d, []).append(ev)
 
-    res = CheckResult(all_dates=dates, sightings=sightings)
+    res = CheckResult(all_dates=dates, sightings=sightings,
+                      day_status=day_status_of(sightings))
     for d, evidence in hits.items():
         for ev in evidence:
             res.add(d, ev)
@@ -330,6 +334,7 @@ def default_state():
         "horizon_unknown_alerted_ts": None,
         "horizon_stall_alerted_ts": None,
         "xhr_urls": [],
+        "day_status": {},   # iso -> {status, comedians, alerts_sent, ...}
     }
 
 
@@ -457,6 +462,114 @@ def handle_check_result(cfg, state, res: CheckResult):
                     f"CHECK MANUALLY: {LINEUP_URL}", "warn")
 
 
+STATUS_LABEL = {
+    NOT_LISTED: "not listed yet",
+    NO_LINEUP: "date listed, no comedians yet",
+    SHOWTIMES: "SHOWTIMES POSTED",
+    LINEUP: "LINEUP ANNOUNCED",
+    UNKNOWN: "unrecognised response",
+}
+
+
+def lineup_body(d, info, cfg, reminder=None):
+    lines = [f"{fmt_date(d)} — {STATUS_LABEL.get(info['status'], info['status'])}.", ""]
+    if info.get("comedians"):
+        lines.append(f"Comedians ({len(info['comedians'])}):")
+        lines.append("  " + ", ".join(info["comedians"][:18])
+                     + (" …" if len(info["comedians"]) > 18 else ""))
+        lines.append("")
+    if info.get("showtimes"):
+        shows = list(dict.fromkeys(info["showtimes"]))
+        lines.append(f"Show times: {', '.join(shows[:10])}")
+    for title in info.get("titles", [])[:5]:
+        lines.append(f"  - {title}")
+    lines.append("")
+    ids = info.get("show_ids") or []
+    if ids:
+        lines.append("Book a specific show:")
+        for sid in ids[:6]:
+            lines.append(f"  {RESERVATIONS_URL}?showid={sid}")
+    else:
+        lines.append(f"Book: {RESERVATIONS_URL}")
+    lines.append(f"Lineup: {LINEUP_URL}")
+    if reminder:
+        lines.append(f"\n(Reminder {reminder} — set ALERT_REPEATS=0 to silence repeats.)")
+    return "\n".join(lines)
+
+
+def lineup_title(d, info):
+    if info["status"] == LINEUP and info.get("comedians"):
+        who = ", ".join(info["comedians"][:3])
+        extra = len(info["comedians"]) - 3
+        return (f"Comedy Cellar {short(d)}: LINEUP UP — {who}"
+                + (f" +{extra}" if extra > 0 else ""))
+    if info["status"] == SHOWTIMES:
+        return f"Comedy Cellar {short(d)}: showtimes posted (no comedians yet)"
+    return f"Comedy Cellar {short(d)}: {info['status']}"
+
+
+def handle_day_status(cfg, state, res: CheckResult):
+    """Alert when a target date moves forward: showtimes posted, comedians named.
+
+    Only forward moves alert. The site briefly serving a worse answer (a blip, a
+    cache) must not fire, and must not reset progress so that recovering re-fires.
+    """
+    now = time.time()
+
+    def observed(rec, info, rank):
+        rec.update(status=info["status"], rank=rank,
+                   comedians=info.get("comedians", [])[:30],
+                   showtimes=list(dict.fromkeys(info.get("showtimes", [])))[:12],
+                   show_ids=info.get("show_ids", [])[:8])
+
+    for d, info in sorted(res.day_status.items()):
+        key, rank = d.isoformat(), RANK[info["status"]]
+        rec = state["day_status"].get(key)
+
+        if rec is None:
+            rec = {"seen_ts": now, "alerts_sent": 0, "last_alert_ts": 0}
+            observed(rec, info, rank)
+            state["day_status"][key] = rec
+            # Baseline. Alert only if it is *already* worth acting on, so a fresh
+            # volume doesn't go quiet on a lineup posted while we were down.
+            if rank >= ALERT_RANK:
+                rec["alerts_sent"], rec["last_alert_ts"] = 1, now
+                enqueue(state, lineup_title(d, info) + " (already posted)",
+                        lineup_body(d, info, cfg), "alert")
+            continue
+
+        rec["seen_ts"] = now
+        if rank > rec.get("rank", -1):
+            log.info("%s advanced: %s -> %s", d, rec.get("status"), info["status"])
+            observed(rec, info, rank)
+            if rank >= ALERT_RANK:
+                rec["alerts_sent"], rec["last_alert_ts"] = 1, now
+                enqueue(state, lineup_title(d, info), lineup_body(d, info, cfg), "alert")
+            else:
+                enqueue(state, f"Comedy Cellar {short(d)}: {STATUS_LABEL[info['status']]}",
+                        lineup_body(d, info, cfg), "info")
+        elif rank == rec.get("rank", -1):
+            observed(rec, info, rank)   # same state, refresh names/times/links
+        else:
+            # Keep the high-water mark so a blip can't re-trigger on recovery.
+            log.warning("%s went backwards: %s -> %s (keeping %s)",
+                        d, rec.get("status"), info["status"], rec.get("status"))
+
+    # Reminders, so one swallowed push can't lose the window.
+    for key, rec in state["day_status"].items():
+        if not rec.get("alerts_sent"):
+            continue
+        if rec["alerts_sent"] <= cfg.alert_repeats and \
+                now - rec["last_alert_ts"] >= cfg.alert_repeat_minutes * 60:
+            d = date.fromisoformat(key)
+            rec["alerts_sent"] += 1
+            rec["last_alert_ts"] = now
+            n = rec["alerts_sent"] - 1
+            enqueue(state, "Reminder: " + lineup_title(d, rec),
+                    lineup_body(d, rec, cfg, reminder=f"{n}/{cfg.alert_repeats}"),
+                    "alert")
+
+
 def handle_horizon(cfg, state, res: CheckResult):
     """The core guarantee: we must always know the site's 'listing through' date.
 
@@ -524,14 +637,22 @@ def status_lines(cfg, state, res: CheckResult):
     with_dates = res.working
     lines.append(f"Strategies reachable: {', '.join(sorted(set(ok))) or 'none'}; "
                  f"producing dates: {', '.join(sorted(set(with_dates))) or 'NONE'}")
-    found = [fmt_date(t) for t in cfg.targets if t.isoformat() in state["found"]]
-    missing = [fmt_date(t) for t in cfg.targets if t.isoformat() not in state["found"]]
-    if found:
-        lines.append("Already found: " + "; ".join(found))
-    if missing:
-        lines.append("Still waiting for: " + "; ".join(missing))
-    else:
-        lines.append("All target dates found — you can stop this service.")
+    lines.append("Target dates:")
+    done = 0
+    for t in cfg.targets:
+        rec = state["day_status"].get(t.isoformat()) or {}
+        status = rec.get("status") or (
+            res.day_status.get(t, {}) or {}).get("status") or "not checked yet"
+        note = STATUS_LABEL.get(status, status)
+        if rec.get("comedians"):
+            note += f" — {', '.join(rec['comedians'][:3])}"
+            if len(rec["comedians"]) > 3:
+                note += f" +{len(rec['comedians']) - 3}"
+        if RANK.get(status, -1) >= ALERT_RANK:
+            done += 1
+        lines.append(f"  {short(t)}: {note}")
+    if done == len(cfg.targets):
+        lines.append("All target dates are posted — you can stop this service.")
     return lines
 
 
@@ -590,6 +711,7 @@ def run(cfg: Config, once=False):
                          [d.isoformat() for d in res.found] or "none",
                          "; ".join(s.detail for s in res.sightings))
                 handle_check_result(cfg, state, res)
+                handle_day_status(cfg, state, res)
                 handle_horizon(cfg, state, res)
                 maybe_heartbeat(cfg, state, res)
                 if not announced:
@@ -694,21 +816,21 @@ def diagnose(cfg) -> int:
             if sample["post_data"]:
                 print(f"             request body: {sample['post_data']}")
             print(f"             response head: {sample['body_head']}")
-    # Control probes: prove the lineup API honours its date parameter, by asking
-    # for dates whose answers we already know. Without this, "shows present" for a
-    # target date could just be today's lineup echoed back.
+    # Per-date status, including reference days that already have comedians, so a
+    # broken classifier shows up as "tomorrow has no lineup either".
     print("-" * 72)
-    print("LINEUP API CONTROL PROBES (expect shows for today/near, none for far)")
-    for label, when in [("today", "today"),
-                        ("today+3", today + timedelta(days=3)),
-                        ("today+20", today + timedelta(days=20)),
-                        ("today+60", today + timedelta(days=60)),
-                        (f"today+{sources.SENTINEL_OFFSET_DAYS} (sentinel)",
-                         today + timedelta(days=sources.SENTINEL_OFFSET_DAYS))]:
-        reachable, fragment, detail = sources.query_lineup_api(http, when)
-        verdict = ("SHOWS" if sources.has_shows(fragment)
-                   else "no shows" if reachable else f"unreachable ({detail})")
-        print(f"  {label:28s} -> {verdict:12s} ({len(fragment)}B)")
+    print("PER-DATE STATUS (near days are the reference: they should show a lineup)")
+    probes = [today + timedelta(days=n) for n in (0, 1, 2)] + list(cfg.targets) + \
+             [today + timedelta(days=300)]
+    for d in probes:
+        info, detail = sources.fetch_day(http, d)
+        if info is None:
+            print(f"  {d} -> UNTRUSTED: {detail}")
+            continue
+        who = ", ".join(info["comedians"][:4])
+        print(f"  {d} -> {info['status']:11s} "
+              f"shows={len(set(info['showtimes'])):2d} comedians={len(info['comedians']):3d}"
+              f" ids={len(info['show_ids']):2d}" + (f"  [{who}]" if who else ""))
     print("-" * 72)
     print("DATE THROUGH:",
           f"{res.horizon} (via {res.horizon_source})" if res.horizon

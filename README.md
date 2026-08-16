@@ -1,9 +1,26 @@
 # Comedy Cellar ticket watcher
 
 Polls [the Comedy Cellar NYC lineup](https://www.comedycellar.com/new-york-line-up/)
-around the clock and **notifies you the moment shows for September 10, 11 or 12, 2026
-are announced** (dates are configurable). Built to run on a VPS via
-[Dokploy](https://dokploy.com/) using the included `Dockerfile`.
+around the clock and **notifies you the moment showtimes are posted or comedians
+are announced** for September 10, 11 or 12, 2026 (dates are configurable). Built
+to run on a VPS via [Dokploy](https://dokploy.com/) using the included `Dockerfile`.
+
+## What a date goes through
+
+A date does not simply appear — it moves through stages, and only the last two
+are worth waking you up for:
+
+| Stage | What the API returns | Alert |
+|---|---|---|
+| `not_listed` | empty — beyond the ~4-week window | – |
+| `no_lineup` | `<p class="no-shows">No Comedians added yet!</p>` | info only |
+| `showtimes` | show times posted, nobody named yet | **push** |
+| `lineup` | `<span class="name">…</span>` per comedian | **push, with names** |
+
+Only forward moves alert, and the high-water mark is kept: if the site briefly
+serves a worse answer, that neither fires nor re-arms, so recovering can't
+double-notify. The push names the comedians and carries per-show booking links
+(`reservations-newyork/?showid=…`), which only exist once a lineup is up.
 
 ## The thing that makes this hard
 
@@ -36,20 +53,12 @@ Every check runs these, cheapest first, and stops early once dates are found:
    → {"show":{"html":"<…6:00 pm show - …>"}}
    ```
 
-   The response never names the date it describes, so it is calibrated against
-   two controls before any answer is believed:
-
-   - **positive** — a date 3 days out, which the site definitely lists, must come
-     back *with* showtimes. Without this, an endpoint that answers "no shows" to
-     everything looks perfectly healthy while detecting nothing.
-   - **negative** — a date ~10 months out, which cannot have a lineup, must come
-     back *without* showtimes, or the endpoint is echoing something unrelated and
-     would report every target as live.
-
-   Several date encodings are tried against those controls. If none passes, the
-   strategy reports "contributes nothing" instead of appearing to work. **On the
-   live site today, none does** — the endpoint only honours its own `"today"`
-   keyword — so detection currently rests on strategy 3. Both guards are tested.
+   It accepts ISO dates and **echoes back the date it answered about**, both as
+   `"date":"2026-09-10"` and in prose (`"Thursday September 10, 2026"`). Every
+   answer must name the date that was asked for, or it is discarded — a stale or
+   ignored date parameter can therefore never produce a false "lineup is up".
+   Responses that don't identify their date at all are not trusted either.
+   This is the strategy that decides the per-date stage above.
 3. **Headless Chromium** — renders the page like a real browser, then harvests
    dates from the live DOM *and* from every same-origin XHR payload. This is
    what establishes the date-through on this site, and what discovered the API
@@ -69,11 +78,13 @@ Every check runs these, cheapest first, and stops early once dates are found:
   | Condition | Alert |
   |---|---|
   | No strategy produced *any* date for 1h | "CANNOT read any dates" — treat as broken |
+  | An answer describes the wrong date | discarded, never alerted on |
   | Date-through frozen ≥3 days (site rolls daily) | "date-through is STUCK" |
   | Every strategy unreachable for 2h | "checker is BLIND" |
   | Recovery from any of the above | recovery notice |
 - **Daily heartbeat** (9am ET) reporting the date-through, which strategy
-  produced it, and which strategies are alive.
+  produced it, which strategies are alive, and **the current stage of each target
+  date** (with the announced comedians once they exist).
 - **The startup notification includes the date-through**, so a redeploy tells you
   within a minute whether detection actually works.
 
@@ -123,8 +134,13 @@ often cannot reach the site):
 | static, homepage | 5 dates, furthest 2027-07-29 — unrelated, hence non-authoritative |
 | `/wp-json/` probes | 3 × 404, 1 × 200 with no dates |
 | headless Chromium | HTTP 200, **29 dates, through 2026-09-07** |
-| lineup API, `"today"` | 30 KB of showtimes |
-| lineup API, ISO dates (+3 / +20 / +60 / +300) | empty every time — date param not honoured |
+| lineup API, Aug 17 (ISO) | 9 shows, **46 comedians**, per-show `?showid=` links |
+| lineup API, Sep 10/11/12 (ISO) | `No Comedians added yet!` — date listed, lineup pending |
+
+An earlier note here claimed the API ignored ISO dates. That was wrong: the
+control date used to test it was 3 days out, and lineups are only posted ~1–3
+days ahead, so the control legitimately had no lineup and the encoding took the
+blame. Driving the real date picker settled it.
 
 So the Cellar lists roughly **four weeks** ahead and rolls the window forward
 daily. The date-through is therefore a live canary: it should advance by one day

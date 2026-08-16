@@ -12,6 +12,7 @@ import glob
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -28,16 +29,13 @@ RESERVATIONS_URL = "https://www.comedycellar.com/reservations-newyork/"
 
 # The site's own lineup endpoint, captured from a browser render on 2026-08-11:
 #   POST /lineup/api/
-#   action=cc_get_shows&json={"date":"today","venue":"newyork","type":"lineup"}
-#   -> {"show": {"html": "<div>…6:00 pm show - …</div>"}}
-# Note it is NOT wp-admin/admin-ajax.php, which answers but ignores this action.
+#   action=cc_get_shows&json={"date":"2026-09-10","venue":"newyork","type":"lineup"}
+#   -> {"show": {"html": "…", "date": "Thursday September 10, 2026"},
+#       "date": "2026-09-10"}
+# It accepts ISO dates and echoes back the date it answered about, which is what
+# makes a per-date status trustworthy. It is NOT wp-admin/admin-ajax.php, which
+# answers but ignores this action.
 LINEUP_API_URL = "https://www.comedycellar.com/lineup/api/"
-
-# The response does not echo the date back, so "shows present" only means "shows
-# for the date we asked about" if the endpoint actually honours the date. A date
-# this far out cannot legitimately have a lineup, so it is queried on every check
-# as a live trust test — see from_lineup_api.
-SENTINEL_OFFSET_DAYS = 300
 
 # The homepage is included because a target date may be announced there in prose;
 # it is deliberately NOT authoritative for the date-through (see AUTHORITATIVE_URLS)
@@ -58,22 +56,6 @@ REST_ENDPOINTS = [
 
 API_ACTION = "cc_get_shows"
 
-# The captured request used the literal keyword "today", and a live probe showed
-# an ISO date returns an empty lineup even for dates the site definitely lists.
-# So the encoding the endpoint expects is unknown: these are tried against a
-# control date until one demonstrably works.
-DATE_ENCODINGS = [
-    ("iso", lambda d: d.isoformat()),
-    ("us-slash", lambda d: d.strftime("%m/%d/%Y")),
-    ("us-slash-short", lambda d: f"{d.month}/{d.day}/{d.year}"),
-    ("dash-us", lambda d: d.strftime("%m-%d-%Y")),
-    ("compact", lambda d: d.strftime("%Y%m%d")),
-    ("epoch", lambda d: str(int(time.mktime(d.timetuple())))),
-]
-
-# Offset used as the positive control: far enough out to be a real test, well
-# inside the ~4-week window the site was measured to publish.
-POSITIVE_PROBE_OFFSET_DAYS = 3
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -110,6 +92,8 @@ class Sighting:
     # Request/response samples from the site's own API, captured during a render
     # so the endpoint can be called directly instead of launching a browser.
     api_samples: list = field(default_factory=list)
+    # date -> {status, comedians, showtimes, titles, show_ids}
+    day_status: dict = field(default_factory=dict)
     # Whether this source's dates may define the date-through.
     authoritative: bool = True
 
@@ -234,14 +218,80 @@ def from_rest(http, targets, today):
 
 
 # --------------------------------------------------------------------------
-# Strategy 3: admin-ajax date probes
+# Strategy 2: the site's own lineup API (per-date status)
 # --------------------------------------------------------------------------
+
+# How far a date has progressed, in order. Each step is a thing worth being told
+# about, and the ordering is what makes "did anything improve?" a simple compare.
+NOT_LISTED = "not_listed"      # empty response: date is beyond the published window
+NO_LINEUP = "no_lineup"        # "No Comedians added yet!" — date exists, nothing booked
+SHOWTIMES = "showtimes"        # show times posted, comedians not named yet
+LINEUP = "lineup"              # comedians announced
+UNKNOWN = "unknown"            # response we don't recognise; never alerts
+
+RANK = {UNKNOWN: -1, NOT_LISTED: 0, NO_LINEUP: 1, SHOWTIMES: 2, LINEUP: 3}
+# At or above this, the user wants a push: there is something to act on.
+ALERT_RANK = RANK[SHOWTIMES]
+
+# Markers taken from live responses on 2026-08-16. A day with a lineup returns
+# set-header blocks with show times and <span class="name"> per comedian; a day
+# without returns exactly '<p class="no-shows">No Comedians added yet!</p>'.
+NO_LINEUP_RE = re.compile(r'class=["\']no-shows|no\s+comedians\s+added', re.I)
+NAME_RE = re.compile(r'<span[^>]*class=["\'][^"\']*\bname\b[^"\']*["\'][^>]*>(.*?)</span>',
+                     re.I | re.S)
+TITLE_RE = re.compile(r'<span[^>]*class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>(.*?)</span>',
+                      re.I | re.S)
+SHOWID_RE = re.compile(r'reservations-[a-z]*newyork/?\?showid=(\d+)', re.I)
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(fragment):
+    return clean_html(TAG_RE.sub(" ", fragment)).strip()
+
+
+def classify_lineup(html):
+    """Turn a lineup HTML fragment into a status plus what it says.
+
+    Comedian names decide 'lineup'; show times alone mean the slots exist but
+    nobody is announced yet. Both are things the user asked to hear about.
+    """
+    html = html or ""
+    comedians, seen = [], set()
+    for raw in NAME_RE.findall(html):
+        name = _plain(raw)
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            comedians.append(name)
+    showtimes = [m.strip() for m in SHOWTIME_RE.findall(_plain(html))]
+    # SHOWTIME_RE has no groups, so findall returns whole matches.
+    titles, seen_t = [], set()
+    for raw in TITLE_RE.findall(html):
+        title = _plain(raw)
+        if title and title.lower() not in seen_t:
+            seen_t.add(title.lower())
+            titles.append(title)
+    show_ids = list(dict.fromkeys(SHOWID_RE.findall(html)))
+
+    if not html.strip():
+        status = NOT_LISTED
+    elif comedians:
+        status = LINEUP
+    elif showtimes:
+        status = SHOWTIMES
+    elif NO_LINEUP_RE.search(html):
+        status = NO_LINEUP
+    else:
+        status = UNKNOWN
+    return {"status": status, "comedians": comedians, "showtimes": showtimes,
+            "titles": titles, "show_ids": show_ids}
+
 
 def query_lineup_api(http, when, venue="newyork"):
     """Ask the lineup endpoint about one date.
 
-    `when` is an already-encoded string (see DATE_ENCODINGS) or a keyword the site
-    accepts, e.g. "today". Returns (reachable, fragment, detail).
+    `when` is a date, or a keyword the site accepts such as "today".
+    Returns (doc or None, detail). The endpoint echoes back the date it answered
+    about, which is checked by the callers below.
     """
     key = when if isinstance(when, str) else when.isoformat()
     payload = {"action": API_ACTION,
@@ -249,124 +299,75 @@ def query_lineup_api(http, when, venue="newyork"):
     status, text = http.post_form(LINEUP_API_URL, payload)
     body = (text or "").strip()
     if status != 200 or not body:
-        return False, "", f"HTTP {status}"
+        return None, f"HTTP {status}"
     try:
         doc = json.loads(body)
     except ValueError:
-        return False, "", "non-JSON response"
-    fragment = ""
-    if isinstance(doc, dict):
-        show = doc.get("show")
-        if isinstance(show, dict):
-            fragment = show.get("html") or ""
-    if not fragment:
-        fragment = json.dumps(doc)
-    return True, clean_html(fragment), "ok"
+        return None, "non-JSON response"
+    if not isinstance(doc, dict):
+        return None, "unexpected JSON shape"
+    return doc, "ok"
+
+
+def lineup_html(doc):
+    show = doc.get("show")
+    return (show or {}).get("html", "") if isinstance(show, dict) else ""
 
 
 def has_shows(fragment):
-    return bool(SHOWTIME_RE.search(fragment))
+    return bool(SHOWTIME_RE.search(fragment or ""))
 
 
-_CALIBRATION = {}
+def fetch_day(http, day):
+    """Status of one date, or None if the answer can't be trusted.
 
-
-def calibrate_lineup_api(http, today, cache=_CALIBRATION):
-    """Find a date encoding the endpoint provably honours.
-
-    Two controls, because either one alone can be fooled:
-
-    * positive — a date a few days out, which the site definitely lists, must come
-      back WITH showtimes. Without this an endpoint that silently answers "no
-      shows" to every encoding looks perfectly healthy while detecting nothing.
-      (Measured on the live site: ISO dates do exactly that.)
-    * negative — a date ~10 months out, which cannot have a lineup, must come back
-      WITHOUT showtimes, or the endpoint is echoing something unrelated and would
-      report every target as live.
-
-    Returns (encoder or None, detail). Cached per day, since the encoding a site
-    accepts does not change between checks.
+    The endpoint returns the date it is describing, both as an ISO string and in
+    prose ("Thursday September 10, 2026"). Requiring that to match the date we
+    asked for is what makes a "lineup posted!" alert trustworthy: a stale or
+    ignored date parameter is caught here rather than paged to the user.
     """
-    if cache.get("day") == today:
-        return cache.get("encoder"), cache.get("detail")
-
-    positive = today + timedelta(days=POSITIVE_PROBE_OFFSET_DAYS)
-    sentinel = today + timedelta(days=SENTINEL_OFFSET_DAYS)
-    encoder, detail = None, ""
-    tried = []
-    for name, enc in DATE_ENCODINGS:
-        reachable, fragment, why = query_lineup_api(http, enc(positive))
-        if not reachable:
-            detail = f"unreachable ({why})"
-            break
-        if not has_shows(fragment):
-            tried.append(name)
-            continue
-        reachable, fragment, _ = query_lineup_api(http, enc(sentinel))
-        if reachable and has_shows(fragment):
-            tried.append(f"{name}(echoes)")
-            continue
-        encoder, detail = enc, f"date encoding '{name}' verified against both controls"
-        break
-    else:
-        detail = (f"no date encoding works (tried {', '.join(tried)}); endpoint only "
-                  f"answers for its own keywords, so it cannot detect a future date")
-
-    cache.update(day=today, encoder=encoder, detail=detail)
-    return encoder, detail
+    doc, detail = query_lineup_api(http, day)
+    if doc is None:
+        return None, detail
+    show = doc.get("show") if isinstance(doc.get("show"), dict) else {}
+    echoed = str(doc.get("date") or show.get("date") or "")
+    if echoed and not text_mentions_date(clean_html(echoed), day):
+        return None, f"answered about {echoed!r}, not {day}"
+    if not echoed:
+        return None, "response did not say which date it describes"
+    info = classify_lineup(lineup_html(doc))
+    info["date"] = day
+    return info, "ok"
 
 
 def from_lineup_api(http, targets, today):
-    """Query the site's own endpoint per target date, if it can be trusted to.
+    """Per-target-date status straight from the endpoint the date picker uses.
 
-    Contributes nothing unless calibration proves the endpoint honours a date
-    encoding — reporting that plainly rather than appearing to work.
+    Not authoritative for the date-through: it is only asked about the target
+    dates, so its dates say nothing about how far ahead the site publishes. That
+    stays the browser's job, which keeps the date-through canary honest.
     """
-    s = Sighting("lineup-api")
-    encoder, detail = calibrate_lineup_api(http, today)
-    if encoder is None:
-        s.ok = not detail.startswith("unreachable")
-        s.detail = f"lineup-api contributes nothing: {detail}"
-        return [s]
-
+    s = Sighting("lineup-api", authoritative=False)
     results, reached = [], False
     for t in targets:
-        reachable, fragment, why = query_lineup_api(http, encoder(t))
-        if not reachable:
-            results.append(f"{t}:{why}")
+        info, detail = fetch_day(http, t)
+        if info is None:
+            results.append(f"{t}:{detail}")
             continue
         reached = True
-        if has_shows(fragment):
-            s.dates.add(t)
-            s.target_hits[t] = f"lineup API returned showtimes for {t}"
-            results.append(f"{t}:SHOWS")
-        else:
-            results.append(f"{t}:none")
-
-    # Health must reflect this check, not a calibration cached when things worked.
-    # Claiming ok here would keep the "checker is BLIND" watchdog quiet during an
-    # outage, which is the one time it needs to fire.
+        s.day_status[t] = info
+        results.append(f"{t}:{info['status']}"
+                       + (f"({len(info['comedians'])} comedians)"
+                          if info["comedians"] else ""))
+        if RANK[info["status"]] >= RANK[NO_LINEUP]:
+            s.dates.add(t)          # the date exists on the site
+        if RANK[info["status"]] >= ALERT_RANK:
+            s.target_hits[t] = (f"lineup API: {info['status']}"
+                                + (f" — {', '.join(info['comedians'][:4])}"
+                                   if info["comedians"] else ""))
     s.ok = reached
-    if not reached:
-        _CALIBRATION.clear()   # re-verify once the endpoint answers again
-    s.detail = f"lineup-api ({detail}) " + ", ".join(results)
+    s.detail = "lineup-api " + ", ".join(results)
     return [s]
-
-
-# --------------------------------------------------------------------------
-# Strategy 4: headless Chromium (renders the JS the other strategies can't see)
-# --------------------------------------------------------------------------
-
-HARVEST_JS = """els => els.map(e => [
-    e.getAttribute('value'), e.getAttribute('data-date'), e.getAttribute('data-day'),
-    e.getAttribute('datetime'), e.getAttribute('href'), e.textContent
-].filter(Boolean).join(' '))"""
-
-HARVEST_SELECTOR = (
-    "option,[value],[data-date],[data-day],[datetime],time,a[href*='date'],"
-    ".date,.day,.show-date,[class*='date'],[class*='day']"
-)
-
 
 def chromium_path():
     """An explicit Chromium binary, or None to let Playwright resolve its own.
@@ -512,3 +513,14 @@ def discover(http, targets, today, static_urls=None, use_browser=True,
         for d, ev in s.target_hits.items():
             hits.setdefault(d, []).append(ev)
     return sightings, dates, hits
+
+
+def day_status_of(sightings):
+    """Merge per-date status across strategies, best-informed wins."""
+    merged = {}
+    for s in sightings:
+        for d, info in s.day_status.items():
+            if RANK[info["status"]] > RANK.get(
+                    merged.get(d, {}).get("status", UNKNOWN), -1):
+                merged[d] = info
+    return merged
