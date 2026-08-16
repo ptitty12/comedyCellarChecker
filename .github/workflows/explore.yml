@@ -1,0 +1,22 @@
+name: Explore live lineup
+
+# One-off investigation: how the lineup page exposes per-date content, and what
+# distinguishes "show scheduled" from "lineup announced". Manual trigger only.
+on:
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "Space-separated YYYY-MM-DD dates to inspect"
+        default: "2026-09-10 2026-09-11 2026-09-12"
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      - run: python explore.py ${{ inputs.dates }}
